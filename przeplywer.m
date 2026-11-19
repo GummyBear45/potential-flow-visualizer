@@ -10,6 +10,10 @@ function varargout = przeplywer
 %     scroll             change strength of the element under the cursor
 %     Shift + scroll     rotate a doublet axis
 %     right-click        delete an element
+%     right-click        panel: position, strength, doublet angle, blinking
+%   Blinking: any element can jump between two positions every half of the
+%   period "Blink T"; "Blinking vortex demo" sets up Aref's blinking vortex
+%   with two-colour dye to show chaotic advection.
 %   Keys (element appears under the cursor)
 %     s source   k sink   v vortex CCW   c vortex CW   d doublet
 %     Delete     remove the selected element
@@ -35,6 +39,7 @@ function varargout = przeplywer
     NPART = 700;                        % tracer particles
     DT = 0.03;                          % flow time advanced per animation frame
     MAXHOP = 0.1;                       % longest particle move per frame
+    NDYE = 6000;                        % dye particles in the blinking demo
 
     % ---- state ----------------------------------------------------------
     U  = 1;                             % freestream speed
@@ -42,6 +47,12 @@ function varargout = przeplywer
     et = zeros(1,0);                    % element types
     es = zeros(1,0);                    % strengths: m, Gamma or kappa
     ea = zeros(1,0);                    % doublet axis angle
+    eb = false(1,0);                    % element blinks between two positions
+    ez2 = zeros(1,0);                   % the position it is NOT at right now
+    eOn = zeros(1,0);                   % half period the element is in (0/1)
+    TB = 4;                             % blink period (flow time)
+    tFlow = 0;                          % flow time, advanced by the timer
+    dyeMode = false;                    % particles coloured by origin, no respawn
     A  = zeros(1,0);  B = zeros(1,0);   % pole coefficients, see header
     sel = 0;  dragIdx = 0;  dragOff = 0;  busy = false;
     menuIdx = 0;                        % element shown in the properties panel
@@ -79,6 +90,10 @@ function varargout = przeplywer
     hCb = colorbar(ax,'Units','normalized','Position',[0.925 0.26 0.014 0.67]);
     ylabel(hCb,'speed |V|');
     hAxis = line('Parent',ax,'XData',NaN,'YData',NaN,'Color','k','LineWidth',2,np{:});
+    hBlinkLn = line('Parent',ax,'XData',NaN,'YData',NaN,'Color',[0.3 0.3 0.3], ...
+        'LineStyle',':','LineWidth',1.2,np{:});
+    hGhost = line('Parent',ax,'XData',NaN,'YData',NaN,'LineStyle','none','Marker','s', ...
+        'MarkerSize',11,'MarkerEdgeColor',[0.3 0.3 0.3],'LineWidth',1.2,np{:});
     mk = @(m,c) line('Parent',ax,'XData',NaN,'YData',NaN,'LineStyle','none', ...
         'Marker',m,'MarkerSize',11,'MarkerFaceColor',c,'MarkerEdgeColor','k', ...
         'LineWidth',1,np{:});
@@ -116,22 +131,34 @@ function varargout = przeplywer
     cStag = chk('Stagnation points + dividing streamlines',0.30,0.30);
     cPart = chk('Particles',0.61,0.10);
     set(cPart,'Callback',@(~,~) toggleParticles());
+    uicontrol(fig,'Style','text','String','Blink T','Units','normalized', ...
+        'Position',[0.715 0.071 0.055 0.035],'BackgroundColor','w','FontSize',10, ...
+        'HorizontalAlignment','right');
+    hTB = uicontrol(fig,'Style','edit','String',num2str(TB),'Units','normalized', ...
+        'Position',[0.775 0.075 0.045 0.035],'BackgroundColor','w','FontSize',10, ...
+        'Callback',@(~,~) setPeriod());
+    uicontrol(fig,'Style','pushbutton','String','Blinking vortex demo','Units','normalized', ...
+        'Position',[0.83 0.07 0.14 0.045],'FontSize',10,'Callback',@(~,~) blinkDemo());
 
     uicontrol(fig,'Style','text','Units','normalized','Position',[0.05 0.012 0.92 0.05], ...
         'BackgroundColor','w','ForegroundColor',[0.35 0.35 0.35],'FontSize',9, ...
         'HorizontalAlignment','left','String', ...
-        ['Drag: move   |   Scroll: strength   |   Shift+Scroll: rotate doublet   |   ' ...
-         'Right-click: position / strength panel   |   Keys under cursor: s source, ' ...
-         'k sink, v vortex CCW, c vortex CW, d doublet, Del remove selected']);
+        ['Drag: move  |  Scroll: strength  |  Shift+Scroll: rotate doublet  |  ' ...
+         'Right-click: properties & blinking  |  Keys: s source, k sink, ' ...
+         'v/c vortex CCW/CW, d doublet, Del remove']);
 
     % properties panel, shown by right-clicking an element
-    MW = 200;  MH = 172;
+    MW = 200;  MH = 253;
     hMenu = uipanel(fig,'Units','pixels','Position',[0 0 MW MH],'Visible','off', ...
         'Title','','FontWeight','bold','BackgroundColor',[0.96 0.96 0.96]);
-    rowLbl = {'x','y','strength','angle [deg]'};
-    hLbl = gobjects(1,4);  hEd = gobjects(1,4);
-    for row = 1:4
-        yr = MH - 22 - row*27;
+    rowLbl = {'x','y','strength','angle [deg]','other x','other y'};
+    rowPos = [1 2 3 4 6 7];             % row 5 holds the blink checkbox
+    hLbl = gobjects(1,6);  hEd = gobjects(1,6);
+    hBlink = uicontrol(hMenu,'Style','checkbox','String','Blink between two positions', ...
+        'Units','pixels','Position',[8 MH-22-5*27 185 22], ...
+        'BackgroundColor',[0.96 0.96 0.96],'Callback',@(~,~) toggleBlink());
+    for row = 1:6
+        yr = MH - 22 - rowPos(row)*27;
         hLbl(row) = uicontrol(hMenu,'Style','text','String',rowLbl{row},'Units','pixels', ...
             'Position',[8 yr-3 78 20],'HorizontalAlignment','left', ...
             'BackgroundColor',[0.96 0.96 0.96]);
@@ -151,7 +178,8 @@ function varargout = przeplywer
     setappdata(fig,'api',struct('add',@addEl,'clear',@clearAll,'redraw',@redraw, ...
         'setU',@apiSetU,'stagnation',@stagnation,'velocity',@conjVel, ...
         'tick',@tick,'particles',@getParticles,'elements',@getElements, ...
-        'openMenu',@openMenu));
+        'openMenu',@openMenu,'blinkDemo',@blinkDemo,'setBlink',@apiSetBlink, ...
+        'setPeriod',@apiSetPeriod,'time',@getTime));
 
     redraw();
 
@@ -249,24 +277,43 @@ function varargout = przeplywer
         pLife(idx) = 300 + floor(400*rand(1,n));
     end
 
+    function t = getTime()
+        t = tFlow;
+    end
+
     function p = getParticles()
         p = pz;
     end
 
     function s = getElements()
-        s = struct('z',ez,'type',et,'strength',es,'angle',ea);
+        s = struct('z',ez,'type',et,'strength',es,'angle',ea, ...
+            'blink',eb,'z2',ez2);
     end
 
     function tick(~,~)
-        % One animation frame: advect the particles with the true velocity
-        % (midpoint rule) and colour them by local speed.
-        if ~isgraphics(fig) || ~get(cPart,'Value'), return; end
+        % One animation frame: advance flow time, move blinking elements,
+        % advect the particles with the true velocity (midpoint rule) and
+        % colour them by local speed, or by origin in dye mode.
+        if ~isgraphics(fig) || busy, return; end
         try
+            tFlow = tFlow + DT;
+            updateBlink();
+            if ~get(cPart,'Value'), return; end
             hop = @(d) d.*min(1, MAXHOP./max(abs(d),eps));   % cap the step length
             zm = pz + 0.5*hop(DT*conj(conjVel(pz)));
             v  = conj(conjVel(zm));
             dz = hop(DT*v);
             pz = pz + dz;
+            if dyeMode
+                % dye is never recycled, otherwise the mixing pattern is lost;
+                % it only vanishes into sinks and doublets (vortices just spin it)
+                sing = reshape(ez(et ~= VOR),[],1);
+                gone = ~isfinite(pz) | any(abs(pz - sing) < max(RKILL,abs(dz)),1);
+                pz(gone) = NaN;
+                set(hP,'XData',real(pz),'YData',imag(pz));
+                drawnow limitrate nocallbacks
+                return
+            end
             pAge = pAge + 1;
             out = real(pz) < XL(1) | real(pz) > XL(2) ...
                 | imag(pz) < YL(1) | imag(pz) > YL(2);
@@ -287,13 +334,104 @@ function varargout = przeplywer
     end
 
     function toggleParticles()
+        % the timer keeps running either way, because it also drives blinking
         if get(cPart,'Value')
-            set([hP hCb],'Visible','on');
-            if strcmp(tmr.Running,'off'), start(tmr); end
+            set(hP,'Visible','on');
+            if ~dyeMode, set(hCb,'Visible','on'); end
         else
-            stop(tmr);
             set([hP hCb],'Visible','off');
         end
+    end
+
+    % =====================================================================
+    %  Blinking elements (Aref's blinking vortex, generalised)
+    % =====================================================================
+    function p = phase()
+        % 0 in the first half of each blink period, 1 in the second
+        p = mod(floor(tFlow/(TB/2)),2);
+    end
+
+    function updateBlink()
+        % Swap a blinking element to its other position at every half period.
+        % The flow is steady in between, so streamlines are redrawn only then.
+        k = find(eb & eOn ~= phase());
+        k(k == dragIdx) = [];                   % do not yank it from the mouse
+        if isempty(k), return; end
+        tmp = ez(k);  ez(k) = ez2(k);  ez2(k) = tmp;
+        eOn(k) = phase();
+        redraw();
+    end
+
+    function setBlink(k,on,z2)
+        if nargin > 2
+            ez2(k) = clampDom(z2);
+        elseif ~isfinite(ez2(k))
+            % default partner position 1.2 to the right, or left near the edge
+            d = 1.2;
+            if real(ez(k)) + d > XL(2), d = -d; end
+            ez2(k) = clampDom(ez(k) + d);
+        end
+        eb(k) = on;
+        eOn(k) = phase();
+        redraw();
+    end
+
+    function toggleBlink()
+        if menuIdx == 0, return; end
+        setBlink(menuIdx, logical(get(hBlink,'Value')));
+    end
+
+    function apiSetBlink(k,on,z2)
+        if nargin > 2, setBlink(k,on,z2); else, setBlink(k,on); end
+    end
+
+    function setPeriod()
+        v = str2double(get(hTB,'String'));
+        if isfinite(v) && v > 0
+            % keep every element in its current half period
+            p0 = phase();  TB = v;
+            tFlow = (floor(tFlow/(TB/2)) + mod(p0 - phase(),2) + 1e-6)*TB/2;
+        end
+        set(hTB,'String',num2str(TB));
+    end
+
+    function apiSetPeriod(v)
+        set(hTB,'String',num2str(v));
+        setPeriod();
+    end
+
+    function blinkDemo()
+        % Aref (1984): one vortex, switched between two positions every half
+        % period. Each half period alone is plain rotation, yet alternating
+        % the two stretches and folds the dye: chaotic advection.
+        clearAll();
+        set(hUsl,'Value',0);  U = 0;  set(hUtxt,'String','U = 0.00');
+        tFlow = 0;
+        ez = -0.6;  et = VOR;  es = 3;  ea = 0;
+        eb = true;  ez2 = 0.6;  eOn = 0;
+        sel = 0;
+        % dye: a disc of fluid around both positions, upper half orange,
+        % lower half blue
+        r = 1.5*sqrt(rand(1,NDYE));  t = 2*pi*rand(1,NDYE);
+        pz = r.*exp(1i*t);
+        col = repmat([0.15 0.45 0.90],NDYE,1);
+        col(imag(pz) > 0,:) = repmat([0.95 0.50 0.10],nnz(imag(pz) > 0),1);
+        dyeMode = true;
+        set(cPart,'Value',1);
+        set(hP,'XData',real(pz),'YData',imag(pz),'CData',col,'SizeData',5, ...
+            'MarkerEdgeColor','none','Visible','on');
+        set(hCb,'Visible','off');
+        redraw();
+    end
+
+    function leaveDye()
+        if ~dyeMode, return; end
+        dyeMode = false;
+        pz = zeros(1,NPART);  pAge = zeros(1,NPART);  pLife = zeros(1,NPART);
+        respawn(true(1,NPART));
+        set(hP,'XData',real(pz),'YData',imag(pz),'CData',zeros(1,NPART), ...
+            'SizeData',14,'MarkerEdgeColor',[0.15 0.15 0.15]);
+        if get(cPart,'Value'), set(hCb,'Visible','on'); end
     end
 
     function killTimer()
@@ -328,8 +466,12 @@ function varargout = przeplywer
         % --- streamlines
         if get(cStr,'Value')
             dy = diff(YL)/NLEFT;
-            z0 = XL(1) + 1i*(YL(1) + dy*((1:NLEFT) - 0.5));
-            sg = ones(1,NLEFT);
+            if U > 1e-6
+                z0 = XL(1) + 1i*(YL(1) + dy*((1:NLEFT) - 0.5));
+            else
+                z0 = zeros(1,0);        % nothing enters from the left without U
+            end
+            sg = ones(size(z0));
             for k = 1:numel(ez)
                 switch et(k)
                     case SRC
@@ -393,6 +535,12 @@ function varargout = przeplywer
         zd = ez(et == DBL);  ed = 0.24*exp(1i*ea(et == DBL));
         seg = [zd - ed; zd + ed; nan(size(zd))];
         set(hAxis,'XData',real(seg(:)),'YData',imag(seg(:)));
+
+        % where blinking elements will jump next
+        zb = ez(eb);  zg = ez2(eb);
+        seg = [zb; zg; nan(size(zb))];
+        set(hBlinkLn,'XData',real(seg(:)),'YData',imag(seg(:)));
+        pts(hGhost, zg);
 
         K = numel(ez);
         for k = numel(hT)+1:K
@@ -466,6 +614,15 @@ function varargout = przeplywer
         set(hEd(4),'String',sprintf('%.1f',mod(rad2deg(ea(k)),360)));
         if et(k) == DBL, vis = 'on'; else, vis = 'off'; end
         set([hLbl(4) hEd(4)],'Enable',vis);
+        set(hBlink,'Value',eb(k));
+        if isfinite(ez2(k))
+            set(hEd(5),'String',sprintf('%.3f',real(ez2(k))));
+            set(hEd(6),'String',sprintf('%.3f',imag(ez2(k))));
+        else
+            set(hEd(5:6),'String','');
+        end
+        if eb(k), vis = 'on'; else, vis = 'off'; end
+        set([hLbl(5:6) hEd(5:6)],'Enable',vis);
     end
 
     function applyMenu()
@@ -479,6 +636,9 @@ function varargout = przeplywer
         end
         if isfinite(val(3)), es(k) = val(3); end
         if isfinite(val(4)), ea(k) = deg2rad(val(4)); end
+        if isfinite(val(5)) && isfinite(val(6))
+            ez2(k) = clampDom(val(5) + 1i*val(6));
+        end
         redraw();
     end
 
@@ -500,6 +660,7 @@ function varargout = przeplywer
         end
         ez(end+1) = clampDom(z);  et(end+1) = type;
         es(end+1) = strength;     ea(end+1) = 0;
+        eb(end+1) = false;  ez2(end+1) = NaN;  eOn(end+1) = 0;
         sel = numel(ez);
         redraw();
     end
@@ -507,6 +668,7 @@ function varargout = przeplywer
     function removeEl(k)
         if k < 1 || k > numel(ez), return; end
         ez(k) = [];  et(k) = [];  es(k) = [];  ea(k) = [];
+        eb(k) = [];  ez2(k) = [];  eOn(k) = [];
         sel = 0;  dragIdx = 0;
         if menuIdx == k
             closeMenu();
@@ -518,8 +680,10 @@ function varargout = przeplywer
 
     function clearAll()
         ez = zeros(1,0);  et = ez;  es = ez;  ea = ez;
+        eb = false(1,0);  ez2 = ez;  eOn = ez;
         sel = 0;  dragIdx = 0;
         closeMenu();
+        leaveDye();
         redraw();
     end
 
