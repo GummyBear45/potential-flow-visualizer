@@ -147,7 +147,7 @@ function varargout = profil
     hMode = uicontrol(fig,'Style','popupmenu','Units','normalized', ...
         'Position',[0.08 0.30 0.20 0.035],'FontSize',10, ...
         'String',{'Joukowski airfoil (exact)','Thin airfoil (source/vortex distributions)'}, ...
-        'Callback',@(~,~) setMode(get(hMode,'Value')));
+        'Callback',@(src,~) setMode(get(src,'Value')));
     chk = @(s,pos) uicontrol(fig,'Style','checkbox','String',s,'Value',1,'Units','normalized', ...
         'Position',pos,'BackgroundColor','w','FontSize',10,'Callback',@(~,~) redraw());
     cVec = chk('Vectors',[0.30 0.30 0.07 0.035]);
@@ -173,10 +173,10 @@ function varargout = profil
 
     btn = @(s,x,w,cb) uicontrol(fig,'Style','pushbutton','String',s,'Units','normalized', ...
         'Position',[x 0.105 w 0.04],'FontSize',10,'Callback',cb);
-    hB = [btn('Symmetric',0.04,0.075,@(~,~) preset(1)), ...
-          btn('Cambered',0.12,0.075,@(~,~) preset(2)), ...
-          btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3)), ...
-          btn(['Close body (' char(8747) char(963) ' = 0)'],0.28,0.12,@(~,~) closeBody())];
+    btn('Symmetric',0.04,0.075,@(~,~) preset(1));
+    btn('Cambered',0.12,0.075,@(~,~) preset(2));
+    btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3));
+    btn(['Close body (' char(8747) char(963) ' = 0)'],0.28,0.12,@(~,~) closeBody());
 
     hInfo = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.10 0.19 0.19], ...
         'BackgroundColor',[0.97 0.97 0.97],'FontSize',9,'HorizontalAlignment','left', ...
@@ -510,14 +510,14 @@ function varargout = profil
         isJ = mode == 1;
         set(pnlZ,'Visible',onoff(isJ));  set(pnlE,'Visible',onoff(~isJ));
         set([hThk hCmb hAoa],'Enable',onoff(isJ));
-        set(hB,'Enable',onoff(~isJ));
         set([hExU hExL],'Visible',onoff(isJ));
         if isJ
             set(hHint,'String',['Joukowski: the circle plane (bottom right) holds a ' ...
                 'freestream, a doublet and a vortex, exactly like przeplywer. ' ...
                 'The map z = ' char(950) ' + b' char(178) '/' char(950) ...
                 ' turns the circle into the airfoil; red + marks the critical points ' ...
-                char(177) 'b. Solid Cp: exact; dashed: thin theory for the same shape.']);
+                char(177) 'b. Solid Cp: exact; dashed: thin theory for the same shape. ' ...
+                'To shape an airfoil with sources and vortices, pick a preset or switch Mode.']);
         else
             set(hHint,'String',['Thin airfoil: drag the red source points (thickness) and ' ...
                 'green vortex points (camber and lift). The airfoil shape follows. ' ...
@@ -564,7 +564,12 @@ function varargout = profil
                 gc = 2*deg2rad(5)*sqrt((1 - XC)./xx);
         end
         gc(end) = 0;
-        if mode == 2, redraw(); end
+        showThin();
+    end
+
+    function showThin()
+        % the distribution buttons work from either mode
+        if mode == 2, redraw(); else, setMode(2); end
     end
 
     function closeBody()
@@ -576,7 +581,7 @@ function varargout = profil
             Iw = trapz(xq,pchip(XC,XC.^2,xq));
             sc = sc - I/Iw*XC.^2;
         end
-        redraw();
+        showThin();
     end
 
     function s = getState()
