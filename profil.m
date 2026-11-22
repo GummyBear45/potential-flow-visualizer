@@ -737,15 +737,17 @@ function varargout = profil
     function [dth,dU] = invRHS(th,Ub,ds,dds,nu)
         % inverse Head method: with delta* given, momentum and entrainment
         % equations form a 2x2 system for theta' and Ue' that stays regular
-        % through separation (the direct form is singular there)
-        H = min(max(ds/th,1.15),8);
-        H1 = headH1(H);  H1H = headH1d(H);
+        % through separation (the direct form is singular there).
+        % (The shape factor is Hs, not H: nested functions share variables
+        % with the app, and H there is the streamline step.)
+        Hs = min(max(ds/th,1.15),8);
+        H1 = headH1(Hs);  H1H = headH1d(Hs);
         Fe = 0.0306*(H1 - 3)^(-0.6169);
-        cf = ludwiegTillmann(H,Ub*th/nu);
+        cf = ludwiegTillmann(Hs,Ub*th/nu);
         % [1, (2+H) th/Ue; Ue (H1 - H H1'), H1 th] [th'; Ue'] = [cf/2; Ue (F - H1' dds)]
         % solved explicitly; det = th ((2+H) H H1' - (1+H) H1) never vanishes
         % because H1' < 0
-        a11 = 1;  a12 = (2 + H)*th/Ub;  a21 = Ub*(H1 - H*H1H);  a22 = H1*th;
+        a11 = 1;  a12 = (2 + Hs)*th/Ub;  a21 = Ub*(H1 - Hs*H1H);  a22 = H1*th;
         b1 = cf/2;  b2 = Ub*(Fe - H1H*dds);
         dt = a11*a22 - a12*a21;
         dth = (b1*a22 - a12*b2)/dt;
@@ -961,14 +963,23 @@ function varargout = profil
     end
 
     function w = wThin(z)
-        % source and vortex panels on the chord line, constant density each
-        % (plus, with the boundary layer on, its displacement sources on the
-        % chord and in the wake and the decambering vortices)
+        % Source and vortex panels of constant density, placed along the
+        % mean line (and the wake along the trailing-edge level) for the
+        % flow picture. The strengths come from linear theory, which puts
+        % them on y = 0; drawing them there would make the streamlines bend
+        % around an invisible flat sheet instead of the airfoil drawn.
+        % A straight panel from z1 to z2 at angle phi gives
+        %   w = (sigma + i gamma) e^(-i phi)/(2 pi) ln((z - z1)/(z - z2))
+        % (plus, with the boundary layer on, its displacement sources and
+        % the decambering vortices)
         sz = size(z);  z = z(:);
-        s = ((sig + sigV + 1i*(gam + gamV))/(2*pi)).';
-        w = U + log((z - xe(1:end-1))./(z - xe(2:end)))*s;
+        zE = xe + 1i*ycE;
+        ph = angle(diff(zE));
+        s = ((sig + sigV + 1i*(gam + gamV)).*exp(-1i*ph)/(2*pi)).';
+        w = U + log((z - zE(1:end-1))./(z - zE(2:end)))*s;
         if any(sigW)
-            w = w + log((z - xwE(1:end-1))./(z - xwE(2:end)))*(sigW/(2*pi)).';
+            zW = xwE + 1i*ycE(end);
+            w = w + log((z - zW(1:end-1))./(z - zW(2:end)))*(sigW/(2*pi)).';
         end
         w = reshape(w,sz);
     end
