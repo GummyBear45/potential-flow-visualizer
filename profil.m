@@ -20,7 +20,13 @@ function varargout = profil
 %     directly; the angle of attack adds the exact flat-plate sheet
 %     gamma = 2 U alpha sqrt((1-x)/x), whose downwash is a uniform -U alpha.
 %     "Keep body closed" shifts the other source points while one is
-%     dragged, so that int sigma = 0.
+%     dragged, so that int sigma = 0. The small bottom slider adds an exact
+%     round nose y_N = sqrt(2 r x)(1 - x) of radius r.
+%
+%   Boundary layer (both modes, optional)
+%     Thwaites -> Michel transition -> Head, Squire-Young drag. Thin mode
+%     uses the Lighthill-Van Dyke leading-edge correction of the surface
+%     speed, which needs the nose radius.
 %
 %   Pressure coefficient
 %     The right-hand plot shows -Cp along the chord. In thin airfoil theory
@@ -58,7 +64,10 @@ function varargout = profil
     mu = 0;  a = b;  betaK = 0;  Gam = 0;  Uc = U;  Ap = 0;  Bp = 0;
     sc = zeros(size(XC));  gc = zeros(size(XC));   % editor shapes (before scaling)
     kS = 1;  kG = 1;  aoaT = 0;             % thin mode: thickness/camber scale, AoA
-    sig = zeros(1,NPAN);  gam = sig;  ytE = zeros(1,NPAN+1);  ycE = ytE;
+    rN = 0.0159;                            % thin mode: nose radius at thickness scale 1
+    sig = zeros(1,NPAN);  gam = sig;  gUsr = sig;   % densities; gUsr = editor part of gamma
+    utC = sig;                              % thickness-induced surface speed u_t at xm
+    ytE = zeros(1,NPAN+1);  ycE = ytE;  ytUsrE = ytE;
     info = {};
     pz = zeros(1,0);  pAge = pz;  pLife = pz;
     dragPt = [0 0];  busy = false;
@@ -142,6 +151,10 @@ function varargout = profil
         'LineStyle','--','LineWidth',1.3,np{:});
     text(axE,0.45,2.45,'dashed: AoA part of \gamma (exact)','FontSize',9, ...
         'Color',[0.55 0.30 0.75],np{:});
+    hEn = line('Parent',axE,'XData',xf,'YData',NaN*xf,'Color',[0.84 0.22 0.18], ...
+        'LineStyle','--','LineWidth',1.3,np{:});
+    text(axE,0.45,2.15,'dashed: round-nose part of \sigma (exact)','FontSize',9, ...
+        'Color',[0.84 0.22 0.18],np{:});
     hEsp = line('Parent',axE,'XData',XC,'YData',sc,'LineStyle','none','Marker','o','MarkerSize',8, ...
         'MarkerFaceColor',[0.84 0.22 0.18],'MarkerEdgeColor','k',np{:});
     hEgp = line('Parent',axE,'XData',XC(1:end-1),'YData',gc(1:end-1),'LineStyle','none', ...
@@ -202,7 +215,8 @@ function varargout = profil
     btn('Cambered',0.12,0.075,@(~,~) preset(2));
     btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3));
 
-    % boundary layer and trailing edge (Joukowski mode)
+    % boundary layer (both modes); the slider below is the trailing-edge
+    % angle in Joukowski mode and the nose radius in thin-airfoil mode
     cBL = uicontrol(fig,'Style','checkbox','String','Boundary layer','Value',0, ...
         'Units','normalized','Position',[0.17 0.06 0.11 0.035],'BackgroundColor','w', ...
         'FontSize',10,'Callback',@(~,~) setBL());
@@ -216,8 +230,8 @@ function varargout = profil
         'Position',[0.29 0.058 0.11 0.03],'BackgroundColor','w','FontSize',10, ...
         'HorizontalAlignment','left');
     hTE = uicontrol(fig,'Style','slider','Min',0,'Max',20,'Value',tauTE, ...
-        'Units','normalized','Position',[0.29 0.026 0.11 0.028],'Callback',@(~,~) setTE());
-    addlistener(hTE,'ContinuousValueChange',@(~,~) setTE());
+        'Units','normalized','Position',[0.29 0.026 0.11 0.028],'Callback',@(~,~) setBottom());
+    addlistener(hTE,'ContinuousValueChange',@(~,~) setBottom());
 
     hInfo = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.10 0.19 0.19], ...
         'BackgroundColor',[0.97 0.97 0.97],'FontSize',9,'HorizontalAlignment','left', ...
@@ -331,39 +345,92 @@ function varargout = profil
     %  speed of the potential flow; no feedback on the outer flow.
     % =====================================================================
     function out = boundaryLayer(geo,zF)
-        nu = U*geo.c/ReN;
+        % Joukowski mode: edge speed = exact surface speed
         [~,iS] = min(abs(geo.zeta - zF));       % front stagnation point
         N = numel(geo.z);
         % stop a little short of the trailing edge, where the inviscid
         % speed of a finite-angle edge drops to zero (a real wake does not)
         stopAt = 0.99;
         paths = {iS:-1:1, iS:N};                 % upper (towards TE first), lower
-        out = struct('cd',0,'sep',false);
+        P = cell(1,2);
         for k = 1:2
             idx = paths{k};
             idx = idx(1:find(geo.x(idx) <= stopAt | (1:numel(idx)) <= 3,1,'last'));
-            z = geo.z(idx);  Ue = max(geo.V(idx),1e-9);
+            P{k} = struct('z',geo.z(idx),'x',geo.x(idx),'Ue',geo.V(idx));
+        end
+        out = blFromPaths(P,geo.c);
+    end
+
+    function out = boundaryLayerThin()
+        % Thin-airfoil mode. Linear theory gives no stagnation point and an
+        % infinite suction peak at the nose, so the edge speed uses the
+        % uniformly valid leading-edge correction of Lighthill and Van Dyke:
+        %   q/U = (1 + u_t/U +- gamma_c/2U) sqrt(x/(x + r/2))
+        %         +- alpha sqrt((1 - x)/(x + r/2))
+        % with r the nose radius, gamma_c the editor (camber) part of gamma
+        % and alpha the flat-plate part. For r -> 0 it is linear theory again.
+        rA = kS^2*rN;                            % actual nose radius
+        c = hypot(1,ycE(end));
+        ut = utC;
+        F = sqrt(xm./(xm + rA/2));
+        G = sqrt((1 - xm)./(xm + rA/2));
+        qu = U*((1 + ut/U + gUsr/(2*U)).*F + aoaT*G);
+        ql = U*((1 + ut/U - gUsr/(2*U)).*F - aoaT*G);
+        yc = interp1(xe,ycE,xm);
+        yt = interp1(xe,ytUsrE,xm) + kS*sqrt(2*rN*xm).*(1 - xm);
+        zu = xm + 1i*(yc + yt);  zl = xm + 1i*(yc - yt);
+        % one path round the body: lower TE -> nose -> upper TE, with the
+        % speed signed along it; the stagnation point is where it changes sign
+        Pz = [fliplr(zl) zu];  Px = [fliplr(xm) xm];  Q = [-fliplr(ql) qu];
+        j = find(Q(1:end-1) <= 0 & Q(2:end) > 0);
+        if isempty(j)
+            j = NPAN;                            % no crossing: start at the nose
+        else
+            [~,m] = min(Px(j) + Px(j+1));  j = j(m);
+        end
+        w = Q(j)/(Q(j) - Q(j+1));
+        zs = Pz(j) + w*(Pz(j+1) - Pz(j));  xs = Px(j) + w*(Px(j+1) - Px(j));
+        P = {struct('z',[zs Pz(j+1:end)],'x',[xs Px(j+1:end)],'Ue',[0 Q(j+1:end)]), ...
+             struct('z',[zs Pz(j:-1:1)],'x',[xs Px(j:-1:1)],'Ue',[0 -Q(j:-1:1)])};
+        % stop at x/c = 0.99 as in Joukowski mode: linear theory slows the
+        % flow to zero at a finite-angle trailing edge (log term in u_t)
+        for k = 1:2
+            n = find(P{k}.x <= 0.99 | (1:numel(P{k}.x)) <= 3,1,'last');
+            P{k} = struct('z',P{k}.z(1:n),'x',P{k}.x(1:n),'Ue',P{k}.Ue(1:n));
+        end
+        out = blFromPaths(P,c);
+        out.zStag = zs;  out.xStag = xs;
+    end
+
+    function out = blFromPaths(P,c)
+        % march both surfaces from the stagnation point; P{1} upper, P{2}
+        % lower, each with complex surface points z, chord position x and
+        % edge speed Ue; Squire-Young drag at the last point
+        nu = U*c/ReN;
+        out = struct('cd',0,'sep',false);
+        for k = 1:2
+            z = P{k}.z;  xk = P{k}.x;  Ue = max(P{k}.Ue,1e-9);
             s = [0 cumsum(abs(diff(z)))];
             r = marchBL(s,Ue,nu);
-            % displacement thickness drawn along the outward normal
-            % the surface runs counter-clockwise, so outward is -i*tangent;
-            % the upper path is walked backwards, which flips the sign
+            % displacement thickness drawn along the outward normal: both
+            % paths run downstream, so outward is +i*tangent on the upper
+            % surface and -i*tangent on the lower
             T = gradient(z);  nrm = (3 - 2*k)*1i*T./abs(T);
             out.dsurf{k} = z + BLX*r.dstar.*nrm;
-            out.x{k} = geo.x(idx);  out.r{k} = r;
-            if r.itr < numel(idx)               % itr = last point: laminar all the way
-                out.zTr(k) = z(r.itr);  out.xTr(k) = geo.x(idx(r.itr));
+            out.x{k} = xk;  out.r{k} = r;  out.Ue{k} = Ue;
+            if r.itr < numel(z)                 % itr = last point: laminar all the way
+                out.zTr(k) = z(r.itr);  out.xTr(k) = xk(r.itr);
             else
                 out.zTr(k) = NaN;  out.xTr(k) = NaN;
             end
             if r.isep > 0
-                out.zSep(k) = z(r.isep);  out.xSep(k) = geo.x(idx(r.isep));
+                out.zSep(k) = z(r.isep);  out.xSep(k) = xk(r.isep);
                 out.sep = true;
             else
                 out.zSep(k) = NaN;  out.xSep(k) = NaN;
             end
             e = find(isfinite(r.theta),1,'last');
-            out.cd = out.cd + 2*r.theta(e)/geo.c*(Ue(e)/U)^((r.H(e) + 5)/2);
+            out.cd = out.cd + 2*r.theta(e)/c*(Ue(e)/U)^((r.H(e) + 5)/2);
         end
     end
 
@@ -382,7 +449,9 @@ function varargout = profil
             [Hf(k),ell] = thwaitesHL(lam);
             Cf(k) = 2*ell*nu/(Ue(k)*theta(k));
             ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
-            if k > 3 && (ReT > 2.9*ReS^0.4 || lam < -0.09)
+            % Michel's criterion in full: the factor (1 + 22400/Re_x) keeps it
+            % from firing near the stagnation point, where Re_x is tiny
+            if k > 3 && (ReT > 1.174*(1 + 22400/ReS)*ReS^0.46 || lam < -0.09)
                 itr = k;  break             % transition (or laminar separation bubble)
             end
         end
@@ -454,6 +523,7 @@ function varargout = profil
     function th = thinFromGeometry(yt,yc,alphaC)
         % sources from the thickness slope, vortices from Glauert's solution
         sig = 2*U*diff(yt)./dxp;
+        utC = (Lmat*sig.').'/(2*pi);
         s = diff(yc)./dxp;                       % camber slope on the panels
         n = (1:NFOU).';
         An = (2/pi)*sum(s.*cos(n*thm),2)*dth;
@@ -471,22 +541,34 @@ function varargout = profil
         % thin theory is linear: scaling sigma scales the thickness, scaling
         % gamma scales the camber; the AoA adds the exact flat-plate sheet,
         % leading-edge singularity included
+        % The round nose is a separate exact thickness term
+        %   y_N = sqrt(2 r x) (1 - x),  sigma_N = U sqrt(2 r) (1 - 3x)/sqrt(x),
+        % closed at the trailing edge by itself; the editor shapes the rest.
         lead = (1 + cos(thm))./sin(thm);
-        sig = kS*U*pchip(XC,sc,xm);
-        gUser = kG*U*pchip(XC,gc,xm);
-        gam = gUser + 2*U*aoaT*lead;
-        ytE = [0 cumsum(sig.*dxp)]/(2*U);
+        sigUsr = kS*U*pchip(XC,sc,xm);
+        sigN = kS*U*sqrt(2*rN)*(1 - 3*xm)./sqrt(xm);
+        sig = sigUsr + sigN;
+        gUsr = kG*U*pchip(XC,gc,xm);
+        gam = gUsr + 2*U*aoaT*lead;
+        ytUsrE = [0 cumsum(sigUsr.*dxp)]/(2*U);
+        ytE = ytUsrE + kS*sqrt(2*rN*xe).*(1 - xe);
+        % u_t: panels for the editor part; the nose term in closed form, since
+        % constant-strength panels cannot hold its 1/sqrt(x) density:
+        %   (1/pi) PV int y_N'/(x - xi) dxi
+        %     = sqrt(2r)/pi * (3 + (1 - 3x)/(2 sqrt x) ln((1 + sqrt x)/(1 - sqrt x)))
+        sq = sqrt(xm);
+        utC = (Lmat*sigUsr.').'/(2*pi) + kS*U*sqrt(2*rN)/pi* ...
+            (3 + (1 - 3*xm)./(2*sq).*log((1 + sq)./(1 - sq)));
         % downwash on the chord line: panels for the editor part, and the
         % exact uniform -U*alpha of the flat-plate sheet (panels would smear
         % its leading-edge singularity)
-        v = -(Lmat*gUser.').'/(2*pi) - U*aoaT;
+        v = -(Lmat*gUsr.').'/(2*pi) - U*aoaT;
         ycE = [0 cumsum(v.*dxp)]/U;
     end
 
     function th = thinCp(gA,gC)
-        ut = (Lmat*sig.').'/(2*pi);
         th.x = xm;
-        th.t = -2*ut/U;
+        th.t = -2*utC/U;
         th.au = -gA/U;  th.al = gA/U;
         th.cu = -gC/U;  th.cl = gC/U;
         th.u = th.t + th.au + th.cu;
@@ -575,21 +657,7 @@ function varargout = profil
                     sprintf('CL thin    = %.4f (x%.3f)',th.CL,CLex/th.CL)};
             if blOn
                 bl = boundaryLayer(geo,zF);
-                ds = [bl.dsurf{1}, NaN, bl.dsurf{2}];
-                set(hBL,'XData',real(ds),'YData',imag(ds));
-                set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
-                set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
-                info{end+1} = sprintf('Re = %.3g, %s* drawn x%d',ReN,char(948),BLX);
-                info{end+1} = ['transition up ' sideStr(bl.xTr(1),'laminar') ...
-                               ', lo ' sideStr(bl.xTr(2),'laminar')];
-                if bl.sep
-                    info{end+1} = ['SEPARATED up ' sideStr(bl.xSep(1),'attached') ...
-                                   ', lo ' sideStr(bl.xSep(2),'attached')];
-                    info{end+1} = 'cd not valid past separation';
-                else
-                    info{end+1} = sprintf('cd (Squire-Young) = %.5f',bl.cd);
-                    info{end+1} = sprintf('L/D = %.0f',CLex/bl.cd);
-                end
+                info = [info, showBL(CLex)];
             else
                 bl = [];
                 set([hBL hTr hSep],'XData',NaN,'YData',NaN);
@@ -615,19 +683,26 @@ function varargout = profil
             c = hypot(1,ycE(end));
             G = sum(gam.*dxp);
             set([hExU hExL],'XData',NaN,'YData',NaN);
-            info = {sprintf('t/c        = %.3f',2*max(ytE)/c), ...
-                    sprintf('camber/c   = %.3f',max(abs(ycE - ycE(end)*xe))/c), ...
+            CLt = 2*G/(U*c);
+            info = {sprintf('t/c %.3f   camber/c %.3f',2*max(ytE)/c, ...
+                        max(abs(ycE - ycE(end)*xe))/c), ...
+                    sprintf('nose r/c   = %.4f',kS^2*rN/c), ...
                     sprintf('AoA (chord)= %.2f deg',rad2deg(alphaC)), ...
                     sprintf('TE gap/c   = %+.4f',2*ytE(end)/c), ...
                     sprintf('%s (cw)     = %.4f',char(915),G), ...
-                    sprintf('CL = 2%s/Uc = %.4f',char(915),2*G/(U*c)), ...
-                    '', ...
-                    'thin theory only'};
+                    sprintf('CL = 2%s/Uc = %.4f',char(915),CLt)};
             if abs(2*ytE(end)) > 0.002
-                info{7} = 'body open: tick Keep body closed';
+                info{end+1} = 'body open: tick Keep body closed';
             end
             if min(ytE) < -1e-3
-                info{8} = 'negative thickness: surfaces cross';
+                info{end+1} = 'negative thickness: surfaces cross';
+            end
+            if blOn
+                bl = boundaryLayerThin();
+                set(hStag,'XData',real(bl.zStag),'YData',imag(bl.zStag));
+                info = [info, showBL(CLt)];
+            else
+                bl = [];
             end
             drawEditor();
         end
@@ -653,6 +728,25 @@ function varargout = profil
         set(hP,'Visible',onoff(get(cPart,'Value')));
     end
 
+    function lines = showBL(CL)
+        % draw the boundary layer held in bl and return its info lines
+        ds = [bl.dsurf{1}, NaN, bl.dsurf{2}];
+        set(hBL,'XData',real(ds),'YData',imag(ds));
+        set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
+        set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
+        lines = {sprintf('Re = %.3g, %s* drawn x%d',ReN,char(948),BLX), ...
+                 ['transition up ' sideStr(bl.xTr(1),'laminar') ...
+                  ', lo ' sideStr(bl.xTr(2),'laminar')]};
+        if bl.sep
+            lines{end+1} = ['SEPARATED up ' sideStr(bl.xSep(1),'attached') ...
+                            ', lo ' sideStr(bl.xSep(2),'attached')];
+            lines{end+1} = 'cd not valid past separation';
+        else
+            lines{end+1} = sprintf('cd (Squire-Young) = %.5f',bl.cd);
+            lines{end+1} = sprintf('L/D = %.0f',CL/bl.cd);
+        end
+    end
+
     function s = sideStr(x,whenNone)
         % x/c of an event on one surface, or a word when it does not happen
         if isfinite(x), s = sprintf('%.2f',x); else, s = whenNone; end
@@ -664,6 +758,8 @@ function varargout = profil
         set(hEsp,'YData',kS*sc);  set(hEgp,'YData',kG*gc(1:end-1));
         ga = 2*aoaT*sqrt((1 - xf)./xf);  ga(1) = NaN;
         set(hEa,'YData',ga);
+        sn = kS*sqrt(2*rN)*(1 - 3*xf)./sqrt(xf);  sn(1) = NaN;
+        set(hEn,'YData',sn);
     end
 
     function s = onoff(tf)
@@ -722,9 +818,8 @@ function varargout = profil
         isJ = mode == 1;
         set(pnlZ,'Visible',onoff(isJ));  set(pnlE,'Visible',onoff(~isJ));
         set([hExU hExL],'Visible',onoff(isJ));
-        set([cBL hRe hTE hTEl],'Enable',onoff(isJ));
-        set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
         configureSliders();
+        configureBottom();
         if isJ
             set(hHint,'String',['Circle plane (bottom right): freestream + doublet + ' ...
                 'vortex, mapped onto the airfoil. Solid Cp exact, dashed thin theory. ' ...
@@ -732,7 +827,8 @@ function varargout = profil
         else
             set(hHint,'String',['Drag red source points (thickness) and green vortex ' ...
                 'points (camber). Sliders scale them linearly; AoA adds the exact ' ...
-                'flat-plate sheet. Cp parts add up to the dashed total.']);
+                'flat-plate sheet, the nose slider an exact round nose. Boundary layer ' ...
+                'uses the Lighthill-Van Dyke leading-edge correction.']);
         end
         readSliders();
         if ~isempty(pz), respawn(true(1,NPART)); end
@@ -788,15 +884,42 @@ function varargout = profil
         redraw();
     end
 
-    function setTE()
-        tauTE = round(get(hTE,'Value')*2)/2;
-        set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
+    function configureBottom()
+        % the small slider: trailing-edge angle (Joukowski) or nose radius (thin)
+        set(hTE,'Min',-1e9,'Max',1e9);
+        if mode == 1
+            set(hTE,'Value',tauTE,'Min',0,'Max',20,'SliderStep',[0.025 0.1]);
+        else
+            set(hTE,'Value',rN,'Min',0,'Max',0.04,'SliderStep',[0.025 0.1]);
+        end
+        bottomLabel();
+    end
+
+    function bottomLabel()
+        if mode == 1
+            set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
+        else
+            set(hTEl,'String',sprintf('nose radius r/c %.4f',rN));
+        end
+    end
+
+    function setBottom()
+        if mode == 1
+            tauTE = round(get(hTE,'Value')*2)/2;
+        else
+            rN = round(get(hTE,'Value')*1e4)/1e4;
+        end
+        bottomLabel();
         redraw();
     end
 
-    function apiSetBL(on,re,te)
-        set(cBL,'Value',on);  set(hRe,'String',num2str(re));  set(hTE,'Value',te);
-        tauTE = te;  set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
+    function apiSetBL(on,re,bottom)
+        % bottom: TE angle [deg] in Joukowski mode, nose radius in thin mode
+        set(cBL,'Value',on);  set(hRe,'String',num2str(re));
+        if nargin > 2
+            if mode == 1, tauTE = bottom; else, rN = bottom; end
+            configureBottom();
+        end
         setBL();
     end
 
@@ -813,10 +936,14 @@ function varargout = profil
     end
 
     function preset(k)
-        xx = max(XC,0.004);
-        dyt = 0.6*(0.2969*0.5./sqrt(xx) - 0.126 - 2*0.3516*xx + 3*0.2843*xx.^2 ...
-            - 4*0.1036*xx.^3);                   % NACA 0012 thickness slope
-        kS = 1;  kG = 1;  aoaT = 0;
+        % NACA 0012 = exact round-nose term (r/c = 0.0159, which carries its
+        % sqrt(x) part) + a smooth remainder for the editor:
+        %   dy/dx(NACA) - dy/dx(nose) = 0.6(-0.126 - 0.7032x + 0.8529x^2
+        %                               - 0.4144x^3) + 1.5*0.17814*sqrt(x)
+        r0 = (0.6*0.2969)^2/2;
+        dyt = 0.6*(-0.126 - 0.7032*XC + 0.8529*XC.^2 - 0.4144*XC.^3) ...
+            + 1.5*sqrt(2*r0)*sqrt(XC);
+        kS = 1;  kG = 1;  aoaT = 0;  rN = r0;
         switch k
             case 1
                 sc = 2*dyt;  gc = zeros(size(XC));
@@ -824,7 +951,7 @@ function varargout = profil
                 sc = 2*dyt;  gc = 16*0.04*sqrt(XC.*(1 - XC));   % parabolic camber, 4 %
             otherwise
                 sc = zeros(size(XC));  gc = zeros(size(XC));    % flat plate ...
-                aoaT = deg2rad(5);                               % ... at 5 deg
+                aoaT = deg2rad(5);  rN = 0;                      % ... at 5 deg, sharp
         end
         gc(end) = 0;
         if get(cClose,'Value'), keepClosed(0); end
@@ -855,6 +982,7 @@ function varargout = profil
         % the distribution buttons work from either mode
         if mode == 2
             configureSliders();
+            configureBottom();
             readSliders();
         else
             setMode(2);
@@ -864,7 +992,7 @@ function varargout = profil
     function s = getState()
         s = struct('mode',mode,'mu',mu,'a',a,'beta',betaK,'Gamma',Gam, ...
             'sigma',sig,'gamma',gam,'yt',ytE,'yc',ycE,'x',xe,'info',{info}, ...
-            'bl',bl,'nKT',nKT);
+            'bl',bl,'nKT',nKT,'rN',rN);
     end
 
     function out = getCp()
