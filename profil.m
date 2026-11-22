@@ -53,6 +53,8 @@ function varargout = profil
     % ---- state ----------------------------------------------------------
     mode = 1;                               % 1 Joukowski, 2 thin airfoil
     thk = 0.12;  cmb = 0.06;  aoa = deg2rad(5);
+    tauTE = 0;  nKT = 2;                    % trailing-edge angle [deg], map exponent
+    blOn = false;  ReN = 1e6;  bl = [];     % boundary layer: switch, Reynolds number, result
     mu = 0;  a = b;  betaK = 0;  Gam = 0;  Uc = U;  Ap = 0;  Bp = 0;
     sc = zeros(size(XC));  gc = zeros(size(XC));   % editor shapes (before scaling)
     kS = 1;  kG = 1;  aoaT = 0;             % thin mode: thickness/camber scale, AoA
@@ -148,6 +150,15 @@ function varargout = profil
         'MarkerEdgeColor',[0.2 0.6 0.3],'LineWidth',1.5,np{:});
     text(axE,0.70,2.75,[char(947) '(1) = 0: Kutta condition'],'FontSize',9,np{:});
 
+    % boundary layer: displacement thickness (exaggerated), transition, separation
+    BLX = 5;                                % drawing exaggeration of delta*
+    hBL = line('Parent',axF,'XData',NaN,'YData',NaN,'Color',[0.85 0.33 0.10], ...
+        'LineWidth',1.4,np{:});
+    hTr = line('Parent',axF,'XData',NaN,'YData',NaN,'LineStyle','none','Marker','^', ...
+        'MarkerSize',8,'MarkerFaceColor',[0.2 0.65 0.3],'MarkerEdgeColor','k',np{:});
+    hSep = line('Parent',axF,'XData',NaN,'YData',NaN,'LineStyle','none','Marker','p', ...
+        'MarkerSize',13,'MarkerFaceColor',[0.85 0.1 0.1],'MarkerEdgeColor','k',np{:});
+
     pf.prepareFigure(fig,[axF axC axZ axE]);
 
     % ---- controls -------------------------------------------------------
@@ -191,18 +202,35 @@ function varargout = profil
     btn('Cambered',0.12,0.075,@(~,~) preset(2));
     btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3));
 
+    % boundary layer and trailing edge (Joukowski mode)
+    cBL = uicontrol(fig,'Style','checkbox','String','Boundary layer','Value',0, ...
+        'Units','normalized','Position',[0.17 0.06 0.11 0.035],'BackgroundColor','w', ...
+        'FontSize',10,'Callback',@(~,~) setBL());
+    uicontrol(fig,'Style','text','String','Re','Units','normalized', ...
+        'Position',[0.17 0.018 0.025 0.03],'BackgroundColor','w','FontSize',10, ...
+        'HorizontalAlignment','left');
+    hRe = uicontrol(fig,'Style','edit','String','1e6','Units','normalized', ...
+        'Position',[0.195 0.022 0.075 0.033],'BackgroundColor','w','FontSize',10, ...
+        'Callback',@(~,~) setBL());
+    hTEl = uicontrol(fig,'Style','text','String','','Units','normalized', ...
+        'Position',[0.29 0.058 0.11 0.03],'BackgroundColor','w','FontSize',10, ...
+        'HorizontalAlignment','left');
+    hTE = uicontrol(fig,'Style','slider','Min',0,'Max',20,'Value',tauTE, ...
+        'Units','normalized','Position',[0.29 0.026 0.11 0.028],'Callback',@(~,~) setTE());
+    addlistener(hTE,'ContinuousValueChange',@(~,~) setTE());
+
     hInfo = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.10 0.19 0.19], ...
         'BackgroundColor',[0.97 0.97 0.97],'FontSize',9,'HorizontalAlignment','left', ...
         'FontName','Consolas');
-    hHint = uicontrol(fig,'Style','text','Units','normalized','Position',[0.17 0.015 0.43 0.08], ...
-        'BackgroundColor','w','ForegroundColor',[0.35 0.35 0.35],'FontSize',9, ...
+    hHint = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.005 0.19 0.09], ...
+        'BackgroundColor','w','ForegroundColor',[0.35 0.35 0.35],'FontSize',8, ...
         'HorizontalAlignment','left');
 
     set(fig,'WindowButtonDownFcn',@onDown,'WindowButtonMotionFcn',@onMove, ...
         'WindowButtonUpFcn',@onUp);
 
     setappdata(fig,'api',struct('setMode',@setMode,'setJoukowski',@apiSetJoukowski, ...
-        'setThin',@apiSetThin,'setControls',@apiSetControls,'preset',@preset, ...
+        'setThin',@apiSetThin,'setBL',@apiSetBL,'setControls',@apiSetControls,'preset',@preset, ...
         'velocity',@physVel,'state',@getState,'cp',@getCp,'tick',@tick));
 
     preset(2);
@@ -220,7 +248,11 @@ function varargout = profil
     %  Joukowski airfoil
     % =====================================================================
     function setJoukowski()
-        % circle through the trailing-edge point zeta = b, Kutta circulation
+        % circle through the trailing-edge point zeta = b, Kutta circulation.
+        % The map exponent n sets the trailing-edge angle (Karman-Trefftz);
+        % n = 2 is the cusped Joukowski airfoil. X0 keeps the TE at x = 1.
+        nKT = 2 - deg2rad(tauTE)/pi;
+        X0 = 1 - nKT*b;
         mu = b*(-thk + 1i*cmb);
         a = abs(b - mu);
         betaK = -angle(b - mu);
@@ -234,22 +266,32 @@ function varargout = profil
         w = pf.poleVelocity(zeta,Uc,mu,Ap,Bp);
     end
 
+    % Karman-Trefftz map  (z - n b)/(z + n b) = ((zeta - b)/(zeta + b))^n.
+    % Written through t = ((zeta - b)/(zeta + b))^n, whose branch cut lies
+    % inside the circle, so the map is smooth everywhere in the flow.
     function z = fmap(zeta)
-        z = zeta + b^2./zeta + X0;
+        t = ((zeta - b)./(zeta + b)).^nKT;
+        z = nKT*b*(1 + t)./(1 - t) + X0;
     end
 
     function d = dmap(zeta)
-        d = 1 - b^2./zeta.^2;
+        t = ((zeta - b)./(zeta + b)).^nKT;
+        d = 4*nKT^2*b^2*t./((1 - t).^2.*(zeta.^2 - b^2));
     end
 
     function [zeta,inside] = invmap(z)
         % the preimage outside the circle; points inside the airfoil have none
-        zz = z - X0;
-        s = sqrt(zz.^2 - 4*b^2);
-        r1 = (zz + s)/2;  r2 = (zz - s)/2;
-        use2 = abs(r2 - mu) > abs(r1 - mu);
-        zeta = r1;  zeta(use2) = r2(use2);
-        inside = abs(zeta - mu) < a;
+        w = (z - X0 - nKT*b)./(z - X0 + nKT*b);
+        best = nan(size(z));  dBest = -inf(size(z));
+        for k = -1:1
+            ph = (angle(w) + 2*pi*k)/nKT;        % t must have its angle in (-pi, pi]
+            t = abs(w).^(1/nKT).*exp(1i*ph);
+            zk = b*(1 + t)./(1 - t);
+            ok = ph > -pi & ph <= pi & abs(zk - mu) > dBest;
+            best(ok) = zk(ok);  dBest(ok) = abs(zk(ok) - mu);
+        end
+        zeta = best;
+        inside = dBest < a;
     end
 
     function w = wParticleJ(zeta)
@@ -279,7 +321,131 @@ function varargout = profil
         yl = pchip(xsl,etaL,xe);
         yu([1 end]) = 0;  yl([1 end]) = 0;
         geo = struct('yt',(yu - yl)/2,'yc',(yu + yl)/2,'c',c, ...
-            'alphaC',aoa - angle(eC),'zLE',zLE,'zTE',zTE);
+            'alphaC',aoa - angle(eC),'zLE',zLE,'zTE',zTE, ...
+            'zeta',zeta,'z',z,'V',V,'x',real(loc));
+    end
+
+    % =====================================================================
+    %  Boundary layer: Thwaites (laminar), Michel (transition), Head
+    %  (turbulent), Squire-Young (profile drag). Edge speed = exact surface
+    %  speed of the potential flow; no feedback on the outer flow.
+    % =====================================================================
+    function out = boundaryLayer(geo,zF)
+        nu = U*geo.c/ReN;
+        [~,iS] = min(abs(geo.zeta - zF));       % front stagnation point
+        N = numel(geo.z);
+        % stop a little short of the trailing edge, where the inviscid
+        % speed of a finite-angle edge drops to zero (a real wake does not)
+        stopAt = 0.99;
+        paths = {iS:-1:1, iS:N};                 % upper (towards TE first), lower
+        out = struct('cd',0,'sep',false);
+        for k = 1:2
+            idx = paths{k};
+            idx = idx(1:find(geo.x(idx) <= stopAt | (1:numel(idx)) <= 3,1,'last'));
+            z = geo.z(idx);  Ue = max(geo.V(idx),1e-9);
+            s = [0 cumsum(abs(diff(z)))];
+            r = marchBL(s,Ue,nu);
+            % displacement thickness drawn along the outward normal
+            % the surface runs counter-clockwise, so outward is -i*tangent;
+            % the upper path is walked backwards, which flips the sign
+            T = gradient(z);  nrm = (3 - 2*k)*1i*T./abs(T);
+            out.dsurf{k} = z + BLX*r.dstar.*nrm;
+            out.x{k} = geo.x(idx);  out.r{k} = r;
+            if r.itr < numel(idx)               % itr = last point: laminar all the way
+                out.zTr(k) = z(r.itr);  out.xTr(k) = geo.x(idx(r.itr));
+            else
+                out.zTr(k) = NaN;  out.xTr(k) = NaN;
+            end
+            if r.isep > 0
+                out.zSep(k) = z(r.isep);  out.xSep(k) = geo.x(idx(r.isep));
+                out.sep = true;
+            else
+                out.zSep(k) = NaN;  out.xSep(k) = NaN;
+            end
+            e = find(isfinite(r.theta),1,'last');
+            out.cd = out.cd + 2*r.theta(e)/geo.c*(Ue(e)/U)^((r.H(e) + 5)/2);
+        end
+    end
+
+    function r = marchBL(s,Ue,nu)
+        n = numel(s);
+        theta = nan(1,n);  Hf = theta;  Cf = theta;
+        dU = gradient(Ue,s);
+        % --- laminar: Thwaites' integral, limit 0.075 nu/(dUe/ds) at stagnation
+        I = cumtrapz(s,Ue.^5);
+        th2 = 0.45*nu*I./Ue.^6;
+        th2(1) = 0.075*nu/max(dU(1),1e-9);
+        itr = n;
+        for k = 1:n
+            theta(k) = sqrt(th2(k));
+            lam = th2(k)/nu*dU(k);
+            [Hf(k),ell] = thwaitesHL(lam);
+            Cf(k) = 2*ell*nu/(Ue(k)*theta(k));
+            ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
+            if k > 3 && (ReT > 2.9*ReS^0.4 || lam < -0.09)
+                itr = k;  break             % transition (or laminar separation bubble)
+            end
+        end
+        % --- turbulent: Head's entrainment method, Heun steps
+        isep = 0;
+        if itr < n
+            Hf(itr) = 1.4;
+            th = theta(itr);  Q = Ue(itr)*th*headH1(1.4);
+            for k = itr:n-1
+                dsl = s(k+1) - s(k);
+                [d1,d2] = headRHS(th,Q,Ue(k),dU(k),nu);
+                [e1,e2] = headRHS(th + dsl*d1,Q + dsl*d2,Ue(k+1),dU(k+1),nu);
+                th = th + dsl/2*(d1 + e1);  Q = Q + dsl/2*(d2 + e2);
+                HH1 = max(Q/(Ue(k+1)*th),3.31);
+                theta(k+1) = th;  Hf(k+1) = headH(HH1);
+                Cf(k+1) = ludwiegTillmann(Hf(k+1),Ue(k+1)*th/nu);
+                if Hf(k+1) > 2.4, isep = k+1;  break; end
+            end
+        end
+        r = struct('theta',theta,'H',Hf,'Cf',Cf,'dstar',Hf.*theta,'itr',itr,'isep',isep);
+        r.dstar(~isfinite(r.dstar)) = NaN;
+    end
+
+    function [Hf,ell] = thwaitesHL(lam)
+        % Thwaites' correlations in the fits of Cebeci and Bradshaw
+        lam = min(max(lam,-0.09),0.1);
+        if lam >= 0
+            ell = 0.22 + 1.57*lam - 1.8*lam^2;
+            Hf = 2.61 - 3.75*lam + 5.24*lam^2;
+        else
+            ell = 0.22 + 1.402*lam + 0.018*lam/(lam + 0.107);
+            Hf = 2.088 + 0.0731/(lam + 0.14);
+        end
+    end
+
+    function [dth,dQ] = headRHS(th,Q,Ue,dU,nu)
+        % momentum integral and entrainment equations, Q = Ue*theta*HH1
+        HH1 = max(Q/(Ue*th),3.31);
+        Hf = headH(HH1);
+        cf = ludwiegTillmann(Hf,Ue*th/nu);
+        dth = cf/2 - (2 + Hf)*th/Ue*dU;
+        dQ = Ue*0.0306*(HH1 - 3)^(-0.6169);
+    end
+
+    function HH1 = headH1(Hf)
+        if Hf <= 1.6
+            HH1 = 3.3 + 0.8234*(Hf - 1.1)^(-1.287);
+        else
+            HH1 = 3.3 + 1.5501*(Hf - 0.6778)^(-3.064);
+        end
+    end
+
+    function Hf = headH(HH1)
+        % inverse of headH1
+        if HH1 >= 5.3
+            Hf = 1.1 + 0.86*(HH1 - 3.3)^(-0.777);
+        else
+            Hf = 0.6778 + 1.1536*(HH1 - 3.3)^(-0.326);
+        end
+    end
+
+    function cf = ludwiegTillmann(H,ReT)
+        cf = 0.246*10^(-0.678*H)*max(ReT,10)^(-0.268);
     end
 
     % =====================================================================
@@ -401,15 +567,35 @@ function varargout = profil
             th = thinFromGeometry(geo.yt,geo.yc,geo.alphaC);
             set(hExU,'XData',xu,'YData',cpu);  set(hExL,'XData',xl,'YData',cpl);
             CLex = 2*(-Gam)/(U*geo.c);
-            info = {sprintf('t/c        = %.3f',2*max(geo.yt)), ...
-                    sprintf('camber/c   = %.3f',max(abs(geo.yc))), ...
+            info = {sprintf('t/c %.3f   camber/c %.3f',2*max(geo.yt),max(abs(geo.yc))), ...
                     sprintf('AoA (chord)= %.2f deg',rad2deg(geo.alphaC)), ...
                     sprintf('zero lift  = %.2f deg',rad2deg(geo.alphaC - aoa - betaK)), ...
                     sprintf('%s (cw)     = %.4f',char(915),-Gam), ...
                     sprintf('CL exact   = %.4f',CLex), ...
-                    sprintf('CL thin    = %.4f',th.CL), ...
-                    sprintf('exact/thin = %.3f',CLex/th.CL)};
+                    sprintf('CL thin    = %.4f (x%.3f)',th.CL,CLex/th.CL)};
+            if blOn
+                bl = boundaryLayer(geo,zF);
+                ds = [bl.dsurf{1}, NaN, bl.dsurf{2}];
+                set(hBL,'XData',real(ds),'YData',imag(ds));
+                set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
+                set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
+                info{end+1} = sprintf('Re = %.3g, %s* drawn x%d',ReN,char(948),BLX);
+                info{end+1} = ['transition up ' sideStr(bl.xTr(1),'laminar') ...
+                               ', lo ' sideStr(bl.xTr(2),'laminar')];
+                if bl.sep
+                    info{end+1} = ['SEPARATED up ' sideStr(bl.xSep(1),'attached') ...
+                                   ', lo ' sideStr(bl.xSep(2),'attached')];
+                    info{end+1} = 'cd not valid past separation';
+                else
+                    info{end+1} = sprintf('cd (Squire-Young) = %.5f',bl.cd);
+                    info{end+1} = sprintf('L/D = %.0f',CLex/bl.cd);
+                end
+            else
+                bl = [];
+                set([hBL hTr hSep],'XData',NaN,'YData',NaN);
+            end
         else
+            set([hBL hTr hSep],'XData',NaN,'YData',NaN);
             solveDistributions();
             xb = [xe fliplr(xe)];  yb = [ycE + ytE, fliplr(ycE - ytE)];
             set(hBody,'XData',xb,'YData',yb);
@@ -465,6 +651,11 @@ function varargout = profil
             set(hQ,'Visible','off');
         end
         set(hP,'Visible',onoff(get(cPart,'Value')));
+    end
+
+    function s = sideStr(x,whenNone)
+        % x/c of an event on one surface, or a word when it does not happen
+        if isfinite(x), s = sprintf('%.2f',x); else, s = whenNone; end
     end
 
     function drawEditor()
@@ -531,20 +722,17 @@ function varargout = profil
         isJ = mode == 1;
         set(pnlZ,'Visible',onoff(isJ));  set(pnlE,'Visible',onoff(~isJ));
         set([hExU hExL],'Visible',onoff(isJ));
+        set([cBL hRe hTE hTEl],'Enable',onoff(isJ));
+        set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
         configureSliders();
         if isJ
-            set(hHint,'String',['Joukowski: the circle plane (bottom right) holds a ' ...
-                'freestream, a doublet and a vortex, exactly like przeplywer. ' ...
-                'The map z = ' char(950) ' + b' char(178) '/' char(950) ...
-                ' turns the circle into the airfoil; red + marks the critical points ' ...
-                char(177) 'b. Solid Cp: exact; dashed: thin theory for the same shape. ' ...
-                'To shape an airfoil with sources and vortices, pick a preset or switch Mode.']);
+            set(hHint,'String',['Circle plane (bottom right): freestream + doublet + ' ...
+                'vortex, mapped onto the airfoil. Solid Cp exact, dashed thin theory. ' ...
+                'Boundary layer: Thwaites + Head, triangle = transition, star = separation.']);
         else
-            set(hHint,'String',['Thin airfoil: drag the red source points (thickness) and ' ...
-                'green vortex points (camber). The sliders scale the two distributions ' ...
-                'linearly, and the angle of attack adds the exact flat-plate vortex sheet, ' ...
-                'so the airfoil turns nose-up in the horizontal freestream. Cp is linear ' ...
-                'theory: the three parts add up exactly to the dashed total.']);
+            set(hHint,'String',['Drag red source points (thickness) and green vortex ' ...
+                'points (camber). Sliders scale them linearly; AoA adds the exact ' ...
+                'flat-plate sheet. Cp parts add up to the dashed total.']);
         end
         readSliders();
         if ~isempty(pz), respawn(true(1,NPART)); end
@@ -590,6 +778,26 @@ function varargout = profil
         if mode ~= 1, setMode(1); end
         set(hThk,'Value',t);  set(hCmb,'Value',c);  set(hAoa,'Value',adeg);
         readSliders();
+    end
+
+    function setBL()
+        v = str2double(get(hRe,'String'));
+        if isfinite(v) && v >= 1e4, ReN = v; end
+        set(hRe,'String',sprintf('%.3g',ReN));
+        blOn = logical(get(cBL,'Value'));
+        redraw();
+    end
+
+    function setTE()
+        tauTE = round(get(hTE,'Value')*2)/2;
+        set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
+        redraw();
+    end
+
+    function apiSetBL(on,re,te)
+        set(cBL,'Value',on);  set(hRe,'String',num2str(re));  set(hTE,'Value',te);
+        tauTE = te;  set(hTEl,'String',sprintf('TE angle %.1f%s',tauTE,char(176)));
+        setBL();
     end
 
     function apiSetThin(ks,kg,adeg)
@@ -655,7 +863,8 @@ function varargout = profil
 
     function s = getState()
         s = struct('mode',mode,'mu',mu,'a',a,'beta',betaK,'Gamma',Gam, ...
-            'sigma',sig,'gamma',gam,'yt',ytE,'yc',ycE,'x',xe,'info',{info});
+            'sigma',sig,'gamma',gam,'yt',ytE,'yc',ycE,'x',xe,'info',{info}, ...
+            'bl',bl,'nKT',nKT);
     end
 
     function out = getCp()
