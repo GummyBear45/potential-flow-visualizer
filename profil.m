@@ -56,6 +56,16 @@ function varargout = profil
     % principal-value kernel: int over panel j of 1/(x_i - xi) dxi
     Lmat = log(abs((xm.' - xe(1:end-1))./(xm.' - xe(2:end))));
 
+    % viscous-inviscid interaction (thin mode): wake panels behind the TE
+    NW = 40;  LW = 1.5;                     % wake panels and length [chords]
+    VIT = 150;  OMG = 0.5;  VTOL = 5e-3;    % iterations, relaxation, tolerance
+    HSW = 2.0;                              % shape factor where the march turns inverse
+    XCPL = 0.96;                            % coupling stops here (TE singularity of linear theory)
+    xwE = 1 + LW*linspace(0,1,NW+1).^1.6;  xwM = (xwE(1:end-1) + xwE(2:end))/2;
+    dxw = diff(xwE);
+    kern = @(xq,ed) log(abs((xq.' - ed(1:end-1))./(xq.' - ed(2:end))));
+    Law = kern(xm,xwE);  Lwa = kern(xwM,xe);  Lww = kern(xwM,xwE);
+
     % ---- state ----------------------------------------------------------
     mode = 1;                               % 1 Joukowski, 2 thin airfoil
     thk = 0.12;  cmb = 0.06;  aoa = deg2rad(5);
@@ -67,10 +77,13 @@ function varargout = profil
     rN = 0.0159;                            % thin mode: nose radius at thickness scale 1
     sig = zeros(1,NPAN);  gam = sig;  gUsr = sig;   % densities; gUsr = editor part of gamma
     utC = sig;                              % thickness-induced surface speed u_t at xm
+    sigUsr = sig;                           % editor part of sigma (without the nose term)
+    sigV = sig;  gamV = sig;  sigW = zeros(1,NW);   % viscous transpiration / decambering
+    vs = [];                                % VII state, kept as warm start
     ytE = zeros(1,NPAN+1);  ycE = ytE;  ytUsrE = ytE;
     info = {};
     pz = zeros(1,0);  pAge = pz;  pLife = pz;
-    dragPt = [0 0];  busy = false;
+    dragPt = [0 0];  busy = false;  quick = false;   % quick: fast BL solve while dragging
 
     % ---- figure ---------------------------------------------------------
     fig = figure('Name','Profil - airfoils in potential flow','NumberTitle','off', ...
@@ -112,7 +125,7 @@ function varargout = profil
     hCcU = ln(cC,'-',1.2);   hCcL = ln(cC,':',1.4);
     hCaU = ln(cA,'-',1.2);   hCaL = ln(cA,':',1.4);
     line('Parent',axC,'XData',[0 1],'YData',[0 0],'Color','k','LineWidth',0.5,np{:});
-    legend(axC,[hExU hExL hThU hThL hCt hCcU hCaU], ...
+    hLeg = legend(axC,[hExU hExL hThU hThL hCt hCcU hCaU], ...
         {'exact, upper','exact, lower','thin theory, upper','thin theory, lower', ...
          'thickness part','camber part (dotted: lower)','angle-of-attack part (dotted: lower)'}, ...
         'Location','northeast','FontSize',8,'AutoUpdate','off');
@@ -204,9 +217,11 @@ function varargout = profil
     hL1 = lbl('',0.245);  hThk = sld(0,0.3,thk,0.245);  hThkV = val(0.245);
     hL2 = lbl('',0.200);  hCmb = sld(-0.15,0.3,cmb,0.200); hCmbV = val(0.200);
     hL3 = lbl('',0.155);  hAoa = sld(-10,15,rad2deg(aoa),0.155); hAoaV = val(0.155);
-    for h = [hThk hCmb hAoa]
-        set(h,'Callback',@(~,~) readSliders());
-        addlistener(h,'ContinuousValueChange',@(~,~) readSliders());
+    % while a slider is dragged a quick (8-iteration) boundary-layer solve
+    % keeps up; the full solve runs when it is released
+    for hs_ = [hThk hCmb hAoa]
+        set(hs_,'Callback',@(~,~) readSliders(false));
+        addlistener(hs_,'ContinuousValueChange',@(~,~) readSliders(true));
     end
 
     btn = @(s,x,w,cb) uicontrol(fig,'Style','pushbutton','String',s,'Units','normalized', ...
@@ -230,8 +245,8 @@ function varargout = profil
         'Position',[0.29 0.058 0.11 0.03],'BackgroundColor','w','FontSize',10, ...
         'HorizontalAlignment','left');
     hTE = uicontrol(fig,'Style','slider','Min',0,'Max',20,'Value',tauTE, ...
-        'Units','normalized','Position',[0.29 0.026 0.11 0.028],'Callback',@(~,~) setBottom());
-    addlistener(hTE,'ContinuousValueChange',@(~,~) setBottom());
+        'Units','normalized','Position',[0.29 0.026 0.11 0.028],'Callback',@(~,~) setBottom(false));
+    addlistener(hTE,'ContinuousValueChange',@(~,~) setBottom(true));
 
     hInfo = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.10 0.19 0.19], ...
         'BackgroundColor',[0.97 0.97 0.97],'FontSize',9,'HorizontalAlignment','left', ...
@@ -361,45 +376,417 @@ function varargout = profil
         out = blFromPaths(P,geo.c);
     end
 
-    function out = boundaryLayerThin()
-        % Thin-airfoil mode. Linear theory gives no stagnation point and an
-        % infinite suction peak at the nose, so the edge speed uses the
-        % uniformly valid leading-edge correction of Lighthill and Van Dyke:
-        %   q/U = (1 + u_t/U +- gamma_c/2U) sqrt(x/(x + r/2))
-        %         +- alpha sqrt((1 - x)/(x + r/2))
-        % with r the nose radius, gamma_c the editor (camber) part of gamma
-        % and alpha the flat-plate part. For r -> 0 it is linear theory again.
-        rA = kS^2*rN;                            % actual nose radius
-        c = hypot(1,ycE(end));
-        ut = utC;
-        F = sqrt(xm./(xm + rA/2));
-        G = sqrt((1 - xm)./(xm + rA/2));
-        qu = U*((1 + ut/U + gUsr/(2*U)).*F + aoaT*G);
-        ql = U*((1 + ut/U - gUsr/(2*U)).*F - aoaT*G);
+    % =====================================================================
+    %  Viscous-inviscid interaction, thin-airfoil mode
+    %  The boundary layer displaces the outer flow by delta*. In thin
+    %  theory that is (i) extra sources d(Ue delta*)/ds on the chord line
+    %  and in the wake, which change the surface speed, and (ii) an extra
+    %  camber (delta*_u - delta*_l)/2, re-solved with Glauert's series,
+    %  which lowers the lift. The turbulent layer is marched in inverse
+    %  mode (delta* given, Ue unknown), which stays regular through
+    %  separation, and delta* is corrected with Carter's semi-inverse rule
+    %      delta*_new = delta* (1 + w (Ue_BL/Ue_outer - 1))
+    %  until both sides agree. Drag comes from Squire-Young at the far end
+    %  of the wake, so it stays valid with separation on the airfoil.
+    % =====================================================================
+    function out = viscousThin(maxIt)
+        % Warm start from the last solution. If that goes badly (a big jump
+        % in the settings), step the angle of attack up from the last good
+        % angle (or 0) in 2 degree steps: coupled solutions are found far
+        % more reliably by continuation than from scratch.
+        good = @(o) ~o.fail && (o.conv || o.res < 0.02);
+        out = viscousSolve(maxIt);
+        if good(out) || maxIt <= 8, return, end
+        keep = vs;  k1 = out;  aT = aoaT;
+        a0 = 0;
+        if ~isempty(keep) && isfield(keep,'aoa') && isfinite(keep.aoa) && keep.aoa < aT
+            a0 = keep.aoa;
+        else
+            vs = [];
+        end
+        n = max(1,ceil(abs(aT - a0)/deg2rad(2)));
+        for kk = 1:n
+            aoaT = a0 + (aT - a0)*kk/n;
+            o = viscousSolve(maxIt);
+            if o.fail, break, end
+        end
+        aoaT = aT;
+        out = viscousSolve(maxIt);
+        if out.fail || (~k1.fail && k1.res < out.res)
+            out = k1;  vs = keep;
+        end
+    end
+
+    function out = viscousSolve(maxIt)
+        rA = kS^2*rN;  c = hypot(1,ycE(end));  nu = U*c/ReN;
+        % Lighthill-Van Dyke leading-edge correction factors
+        Fm = sqrt(xm./(xm + rA/2));  Gm = sqrt((1 - xm)./(xm + rA/2));
+        lead = (1 + cos(thm))./sin(thm);  nn = (1:NFOU).';
+        utW0 = (Lwa*sigUsr.').'/(2*pi) + kS*U*sqrt(2*rN)/pi*noseU(xwM);
+        if isempty(vs) || ~all(isfinite([vs.dsU vs.dsL vs.dsW vs.UeU vs.UeL vs.UeW]))
+            vs = struct('dsU',zeros(1,NPAN),'dsL',zeros(1,NPAN),'dsW',zeros(1,NW), ...
+                'UeU',U*ones(1,NPAN),'UeL',U*ones(1,NPAN),'UeW',U*ones(1,NW),'cold',true, ...
+                'turb',false(2,NPAN),'aoa',NaN);
+        end
+        prev = vs;  xTrFix = [NaN NaN];  jFix = NaN;
+        om = OMG;  best = inf;  retries = 0;     % relaxation, cut only when diverging
+        res = inf;  it = 0;  rW = 0;  hist = nan(1,maxIt);
+        while it < maxIt
+            it = it + 1;
+            % --- outer flow with the displacement effect
+            [sa,sw,dyc] = transpiration();
+            dut  = (Lmat*sa.' + Law*sw.').'/(2*pi);
+            dutW = (Lwa*sa.' + Lww*sw.').'/(2*pi);
+            dS = diff(dyc)./dxp;
+            dA0 = -(1/pi)*sum(dS)*dth;
+            dAn = (2/pi)*sum(dS.*cos(nn*thm),2)*dth;
+            dgc = 2*U*sum(dAn.*sin(nn*thm),1);
+            qu = U*((1 + (utC + dut)/U + (gUsr + dgc)/(2*U)).*Fm + (aoaT + dA0)*Gm);
+            ql = U*((1 + (utC + dut)/U - (gUsr + dgc)/(2*U)).*Fm - (aoaT + dA0)*Gm);
+            UeWi = U + utW0 + dutW;
+
+            % --- boundary layer from the stagnation point along both surfaces
+            [P,zs,jS] = thinPaths(qu,ql,jFix);
+            if it == 5, jFix = jS; end          % freeze the stagnation panel too
+            dsS = [vs.dsU; vs.dsL];  UeS = [vs.UeU; vs.UeL];
+            dsN = dsS;  r = cell(1,2);  res = 0;  turbN = false(2,NPAN);
+            for k = 1:2
+                p = P{k};  on = p.surf > 0;
+                s = [0 cumsum(abs(diff(p.z)))];
+                % prescribed delta* for the inverse part: last iteration's,
+                % only where the layer was turbulent then
+                dsP = nan(size(p.x));
+                if ~vs.cold
+                    ii = sub2ind([2 NPAN],p.surf(on),p.id(on));
+                    v = dsS(ii);  v(~vs.turb(ii)) = NaN;
+                    dsP(on) = v;
+                end
+                r{k} = marchVII(s,max(p.Ue,1e-9),dsP,nu,p.x,xTrFix(k));
+                rr = r{k};
+                % new delta*: direct stations (laminar, attached turbulent)
+                % under-relaxed towards the march, inverse stations by Carter
+                ii = sub2ind([2 NPAN],p.surf(on),p.id(on));
+                dnew = rr.dstar;
+                old = nan(size(p.x));  old(on) = dsS(ii);
+                % local relaxation (Le Balleur): the outer response to a
+                % delta* wiggle of spacing ds grows like pi/ds, so the step
+                % must shrink like ds/(pi delta*) where the panels are dense
+                dsl = gradient(s);
+                omLoc = min(om,dsl./(pi*max(rr.dstar,1e-6)));
+                dirK = 1:min(rr.ksw - 1,numel(s));
+                inC = p.x <= XCPL;                   % stations taking part in the coupling
+                okD = dirK(isfinite(old(dirK)) & dirK > rr.itr + 2 & ~vs.cold & inC(dirK));
+                if ~isempty(okD)
+                    rD = max(abs(dnew(okD) - old(okD)))/max(max(dnew(okD)),1e-9);
+                    res = max(res,rD);
+                    w_ = omLoc(okD);
+                    dnew(okD) = (1 - w_).*old(okD) + w_.*dnew(okD);
+                end
+                if rr.ksw <= numel(s)
+                    t = rr.ksw:numel(s);  t = t(inC(t));
+                end
+                if rr.ksw <= numel(s) && ~isempty(t)
+                    ratio = rr.UeB(t)./max(p.Ue(t),0.05*U);
+                    res = max(res,max(abs(ratio - 1)));
+                    % Carter's step, limited to -20 % / +25 % per iteration
+                    dnew(t) = rr.dsUsed(t).*min(max(1 + omLoc(t).*(ratio - 1),0.8),1.25);
+                end
+                % near the trailing edge linear theory stops the flow (finite
+                % TE angle); keep that out of the iteration and extend delta*
+                % linearly from just upstream
+                tc = find(inC & (1:numel(s)) > max(rr.itr,3),2,'last');
+                if numel(tc) == 2 && any(~inC)
+                    slope = max((dnew(tc(2)) - dnew(tc(1)))/max(s(tc(2)) - s(tc(1)),1e-9),0);
+                    tail = find(~inC & (1:numel(s)) > tc(2));
+                    dnew(tail) = dnew(tc(2)) + slope*(s(tail) - s(tc(2)));
+                end
+                dsN(ii) = max(dnew(on),0);
+                UeS(ii) = rr.UeB(on);
+                tb = false(size(p.x));  tb(rr.itr:end) = rr.itr < numel(p.x);
+                turbN(ii) = tb(on);
+                if it == 5, xTrFix(k) = p.x(rr.itr); end   % freeze transition
+                % stations past x/c = 0.99 are not marched: hold the last value
+                last = find(on,1,'last');
+                rest = p.id(last)+1:NPAN;
+                dsN(p.surf(last),rest) = dsN(p.surf(last),p.id(last));
+                UeS(p.surf(last),rest) = UeS(p.surf(last),p.id(last));
+            end
+            vs.dsU = dsN(1,:);  vs.dsL = dsN(2,:);
+            vs.UeU = UeS(1,:);  vs.UeL = UeS(2,:);  vs.turb = turbN;
+
+            % --- wake: the two layers merge at the trailing edge
+            eU = find(isfinite(r{1}.theta),1,'last');  eL = find(isfinite(r{2}.theta),1,'last');
+            th0 = r{1}.theta(eU) + r{2}.theta(eL);
+            ds0 = r{1}.dstar(eU) + r{2}.dstar(eL);
+            Ue0 = (r{1}.UeB(eU) + r{2}.UeB(eL))/2;
+            [thW,HW] = wakeMarch(th0,ds0,Ue0,UeWi);
+            dsWn = HW.*thW;
+            if vs.cold
+                vs.dsW = dsWn;
+            else
+                rW = mean(abs(dsWn - vs.dsW))/max(mean(dsWn),1e-9);
+                wW = min(0.3,dxw./(pi*max(dsWn,1e-6)));   % local, as on the airfoil
+                vs.dsW = (1 - wW).*vs.dsW + wW.*dsWn;
+            end
+            vs.UeW = UeWi;
+            resBL = res;                             % boundary layer only: drives the relaxation
+            if ~vs.cold, res = max(res,rW); end
+            wasCold = vs.cold;  vs.cold = false;
+            if wasCold, res = inf; end               % nothing to compare with yet
+            hist(it) = res;
+            bad = ~all(isfinite([vs.dsU vs.dsL vs.dsW vs.UeU vs.UeL])) ...
+                || isnan(res) || max([vs.dsU vs.dsL]) > 0.2*c ...
+                || ~all(isfinite(thW)) || ~all(isfinite([qu ql]));
+            if bad
+                % diverged: return to the last good state with a smaller step
+                retries = retries + 1;
+                vs = prev;  om = om/2;  best = inf;
+                if retries > 3, break, end
+                continue
+            end
+            % the last good iteration is what gets reported
+            G = struct('r',{r},'P',{P},'zs',zs,'qu',qu,'ql',ql,'thW',thW,'HW',HW, ...
+                'UeWi',UeWi,'ds0',ds0,'sa',sa,'sw',sw,'dA0',dA0,'dAn',dAn,'dgc',dgc);
+            if wasCold || resBL < best
+                best = min(resBL,best);  prev = vs;  % remember the best state so far
+            elseif resBL > 3*best
+                om = max(om*0.7,0.05);               % growing: relax harder
+            end
+            if res < VTOL && it > 5, break; end
+        end
+        if ~exist('G','var')
+            % never got a good iteration: report nothing rather than garbage
+            vs = [];  sigV(:) = 0;  gamV(:) = 0;  sigW(:) = 0;
+            out = struct('fail',true,'conv',false,'it',it,'res',inf);
+            return
+        end
+        r = G.r;  P = G.P;  zs = G.zs;  qu = G.qu;  ql = G.ql;  thW = G.thW;  HW = G.HW;
+        UeWi = G.UeWi;  ds0 = G.ds0;  sa = G.sa;  sw = G.sw;
+        dA0 = G.dA0;  dAn = G.dAn;  dgc = G.dgc;
+
+        % viscous corrections kept for the flow field
+        sigV = sa;  sigW = sw;  gamV = 2*U*dA0*lead + dgc;
+
+        % results for drawing and the info box
+        if res < 0.02, vs.aoa = aoaT; else, vs.aoa = NaN; end   % for continuation
+        out = struct('fail',false,'cd',0,'sep',false,'it',it,'res',res,'conv',res < VTOL, ...
+            'qu',qu,'ql',ql,'zStag',zs,'dCL',pi*(2*dA0 + dAn(1)));
+        for k = 1:2
+            p = P{k};  rr = r{k};
+            T = gradient(p.z);  nrm = (3 - 2*k)*1i*T./abs(T);
+            out.dsurf{k} = p.z + BLX*rr.dstar.*nrm;
+            if rr.itr < numel(p.z)
+                out.zTr(k) = p.z(rr.itr);  out.xTr(k) = p.x(rr.itr);
+            else
+                out.zTr(k) = NaN;  out.xTr(k) = NaN;
+            end
+            out.zSep(k) = NaN;  out.xSep(k) = NaN;  out.xRe(k) = NaN;
+            if rr.isep > 0
+                out.zSep(k) = p.z(rr.isep);  out.xSep(k) = p.x(rr.isep);  out.sep = true;
+                if rr.ireat > 0, out.xRe(k) = p.x(rr.ireat); end
+            end
+        end
+        yTE = ycE(end);
+        out.wake = [1 xwM] + 1i*(yTE + BLX*[ds0 vs.dsW]/2);
+        out.wakeL = [1 xwM] + 1i*(yTE - BLX*[ds0 vs.dsW]/2);
+        out.cd = 2*thW(end)/c*(UeWi(end)/U)^((HW(end) + 5)/2);
+        out.thW = thW;  out.HW = HW;  out.P = P;  out.r = r;  out.hist = hist(1:it);
+
+        function [sa_,sw_,dyc_] = transpiration()
+            % sources d(Ue delta*)/dx from the mass defect Ue*delta*, and the
+            % displacement camber (delta*_u - delta*_l)/2, on the panel edges
+            % (smoothed over a few panels: the drop of delta* at transition
+            % would otherwise be a point sink that drags transition upstream)
+            % (to first order, as everywhere in thin theory, the mass defect
+            % is U*delta*; using the iterated Ue here feeds back into itself
+            % and locks the iteration in a two-cycle)
+            % Smoothing is over a fixed length (3 % of chord) rather than a
+            % number of panels: the cosine panels are very dense at both
+            % edges, where differentiating delta* would amplify any noise.
+            mU = smoothX(U*vs.dsU);  mL = smoothX(U*vs.dsL);
+            mW = U*vs.dsW;
+            toE = @(v) [0 interp1(xm,v,xe(2:end-1)) v(end)];
+            mUe = toE(mU);  mLe = toE(mL);
+            mWe = [mUe(end) + mLe(end), interp1(xwM,mW,xwE(2:end-1)), mW(end)];
+            sa_ = diff(mUe + mLe)./dxp;
+            sw_ = diff(mWe)./dxw;
+            dyc_ = (toE(smoothX(vs.dsU)) - toE(smoothX(vs.dsL)))/2;
+        end
+
+        function v = smoothX(v)
+            % moving average over 0.03 chord on a uniform grid in x
+            xu = linspace(xm(1),xm(end),301);
+            vu = movmean(interp1(xm,v,xu),9);
+            v = interp1(xu,vu,xm);
+        end
+    end
+
+    function [P,zs,j] = thinPaths(qu,ql,jFix)
+        % one path round the body (lower TE -> nose -> upper TE) with the
+        % speed signed along it; the stagnation point is where it changes
+        % sign. Returns the two downstream paths, each point tagged with its
+        % surface (1 upper, 2 lower, 0 the stagnation point) and panel index.
         yc = interp1(xe,ycE,xm);
         yt = interp1(xe,ytUsrE,xm) + kS*sqrt(2*rN*xm).*(1 - xm);
         zu = xm + 1i*(yc + yt);  zl = xm + 1i*(yc - yt);
-        % one path round the body: lower TE -> nose -> upper TE, with the
-        % speed signed along it; the stagnation point is where it changes sign
         Pz = [fliplr(zl) zu];  Px = [fliplr(xm) xm];  Q = [-fliplr(ql) qu];
+        Sf = [2*ones(1,NPAN) ones(1,NPAN)];  Id = [NPAN:-1:1, 1:NPAN];
         j = find(Q(1:end-1) <= 0 & Q(2:end) > 0);
-        if isempty(j)
+        if isfinite(jFix)
+            j = jFix;                            % held fixed while iterating
+        elseif isempty(j)
             j = NPAN;                            % no crossing: start at the nose
         else
             [~,m] = min(Px(j) + Px(j+1));  j = j(m);
         end
         w = Q(j)/(Q(j) - Q(j+1));
+        if ~isfinite(w), w = 0.5; end
         zs = Pz(j) + w*(Pz(j+1) - Pz(j));  xs = Px(j) + w*(Px(j+1) - Px(j));
-        P = {struct('z',[zs Pz(j+1:end)],'x',[xs Px(j+1:end)],'Ue',[0 Q(j+1:end)]), ...
-             struct('z',[zs Pz(j:-1:1)],'x',[xs Px(j:-1:1)],'Ue',[0 -Q(j:-1:1)])};
-        % stop at x/c = 0.99 as in Joukowski mode: linear theory slows the
-        % flow to zero at a finite-angle trailing edge (log term in u_t)
+        ix = {j+1:2*NPAN, j:-1:1};  sg = [1 -1];
+        P = cell(1,2);
         for k = 1:2
-            n = find(P{k}.x <= 0.99 | (1:numel(P{k}.x)) <= 3,1,'last');
-            P{k} = struct('z',P{k}.z(1:n),'x',P{k}.x(1:n),'Ue',P{k}.Ue(1:n));
+            q = ix{k};
+            % stop at x/c = 0.99: linear theory slows the flow to zero at a
+            % finite-angle trailing edge (log term in u_t)
+            q = q(1:find(Px(q) <= 0.99 | (1:numel(q)) <= 3,1,'last'));
+            P{k} = struct('z',[zs Pz(q)],'x',[xs Px(q)],'Ue',[0 sg(k)*Q(q)], ...
+                'surf',[0 Sf(q)],'id',[0 Id(q)]);
         end
-        out = blFromPaths(P,c);
-        out.zStag = zs;  out.xStag = xs;
+    end
+
+    function r = marchVII(s,Ue,dsP,nu,xp,xTrFix)
+        % Laminar: Thwaites (direct) up to Michel transition or laminar
+        % separation; with xTrFix given, transition is held at that x.
+        % Turbulent: Head's momentum and entrainment equations, inverse
+        % (delta* = dsP given, Ue solved) once dsP is known, direct on the
+        % first pass.
+        n = numel(s);
+        theta = nan(1,n);  Hf = theta;  UeB = Ue;
+        dU = gradient(Ue,s);
+        dUs = gradient(movmean(Ue,5),s);         % pressure gradient seen by lambda
+        m3 = min(3,n);  dUs(1:m3) = dU(1:m3);
+        I = cumtrapz(s,Ue.^5);
+        th2 = 0.45*nu*I./Ue.^6;
+        th2(1) = 0.075*nu/max(dU(1),1e-9);
+        itr = n;
+        for k = 1:n
+            theta(k) = sqrt(th2(k));
+            lam = th2(k)/nu*dUs(k);
+            Hf(k) = thwaitesHL(lam);
+            ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
+            if isfinite(xTrFix)
+                go = k > 3 && (xp(k) >= xTrFix || lam < -0.09);
+            else
+                go = k > 3 && (ReT > 1.174*(1 + 22400/ReS)*ReS^0.46 || lam < -0.09);
+            end
+            if go, itr = k;  break, end
+        end
+        isep = 0;  ireat = 0;  ksw = n + 1;  dsUsed = nan(1,n);
+        if itr < n
+            % --- turbulent, direct (outer speed prescribed) while attached
+            th = theta(itr);  Hf(itr) = 1.4;  Q = Ue(itr)*th*headH1(1.4);
+            for k = itr:n-1
+                h = s(k+1) - s(k);
+                [d1,d2] = headRHS(th,Q,Ue(k),dU(k),nu);
+                [e1,e2] = headRHS(th + h*d1,Q + h*d2,Ue(k+1),dU(k+1),nu);
+                thN = th + h/2*(d1 + e1);  QN = Q + h/2*(d2 + e2);
+                HN = headH(max(QN/(Ue(k+1)*thN),3.31));
+                if HN > HSW || ~isfinite(HN), ksw = k + 1;  break, end
+                th = thN;  Q = QN;  theta(k+1) = th;  Hf(k+1) = HN;
+            end
+            % --- turbulent, inverse (delta* prescribed) once H passes HSW:
+            % regular through separation, where the direct form is singular
+            if ksw <= n
+                k0 = ksw - 1;                     % last direct station
+                ds0_ = Hf(k0)*theta(k0);
+                kk = ksw:n;
+                dsUsed(kk) = dsP(kk);
+                if ~all(isfinite(dsUsed(kk)))
+                    % no previous inverse solution here: let delta* keep
+                    % growing at the rate it had when the switch happened
+                    g = max((ds0_ - Hf(max(k0-3,itr))*theta(max(k0-3,itr))) ...
+                        /max(s(k0) - s(max(k0-3,itr)),1e-9),0);
+                    guess = ds0_ + 1.5*g*(s(kk) - s(k0));
+                    bad_ = ~isfinite(dsUsed(kk));
+                    dsUsed(kk(bad_)) = guess(bad_);
+                end
+                dsUsed(kk) = max(dsUsed(kk),1.1*ds0_/HSW);
+                Ub = Ue(k0);  dsPrev = ds0_;
+                Umax = 1.5*max(Ue);
+                for k = k0:n-1
+                    h = s(k+1) - s(k);  dd = (dsUsed(k+1) - dsPrev)/h;
+                    [a1,b1] = invRHS(th,Ub,dsPrev,dd,nu);
+                    [a2,b2] = invRHS(th + h*a1,Ub + h*b1,dsUsed(k+1),dd,nu);
+                    th = max(th + h/2*(a1 + a2),1e-8);
+                    Ub = min(max(Ub + h/2*(b1 + b2),0.02*U),Umax);
+                    theta(k+1) = th;  UeB(k+1) = Ub;  Hf(k+1) = dsUsed(k+1)/th;
+                    dsPrev = dsUsed(k+1);
+                end
+            end
+            t = find(Hf(itr+2:n) > 2.4,1);
+            if ~isempty(t)
+                isep = itr + 1 + t;
+                t2 = find(Hf(isep:n) < 2.0,1);
+                if ~isempty(t2), ireat = isep + t2 - 1; end
+            end
+        end
+        r = struct('theta',theta,'H',Hf,'dstar',Hf.*theta,'UeB',UeB, ...
+            'itr',itr,'isep',isep,'ireat',ireat,'ksw',ksw,'dsUsed',dsUsed);
+    end
+
+    function [dth,dU] = invRHS(th,Ub,ds,dds,nu)
+        % inverse Head method: with delta* given, momentum and entrainment
+        % equations form a 2x2 system for theta' and Ue' that stays regular
+        % through separation (the direct form is singular there)
+        H = min(max(ds/th,1.15),8);
+        H1 = headH1(H);  H1H = headH1d(H);
+        Fe = 0.0306*(H1 - 3)^(-0.6169);
+        cf = ludwiegTillmann(H,Ub*th/nu);
+        % [1, (2+H) th/Ue; Ue (H1 - H H1'), H1 th] [th'; Ue'] = [cf/2; Ue (F - H1' dds)]
+        % solved explicitly; det = th ((2+H) H H1' - (1+H) H1) never vanishes
+        % because H1' < 0
+        a11 = 1;  a12 = (2 + H)*th/Ub;  a21 = Ub*(H1 - H*H1H);  a22 = H1*th;
+        b1 = cf/2;  b2 = Ub*(Fe - H1H*dds);
+        dt = a11*a22 - a12*a21;
+        dth = (b1*a22 - a12*b2)/dt;
+        dU = (a11*b2 - a21*b1)/dt;
+    end
+
+    function d = headH1d(H)
+        % derivative of headH1
+        if H <= 1.6
+            d = -1.287*0.8234*(H - 1.1)^(-2.287);
+        else
+            d = -3.064*1.5501*(H - 0.6778)^(-4.064);
+        end
+    end
+
+    function [thW,HW] = wakeMarch(th0,ds0,Ue0,Uw)
+        % Head's method with zero wall friction along the wake centre line
+        xw = [1 xwM];  Uq = [Ue0 Uw];  n = numel(xw);
+        dUq = gradient(Uq,xw);
+        th = th0;  H0 = min(max(ds0/th0,1.12),6);  Q = Ue0*th*headH1(H0);
+        thW = zeros(1,n-1);  HW = thW;
+        for k = 1:n-1
+            h = xw(k+1) - xw(k);
+            [a1,b1] = wakeRHS(th,Q,Uq(k),dUq(k));
+            [a2,b2] = wakeRHS(th + h*a1,Q + h*b1,Uq(k+1),dUq(k+1));
+            th = th + h/2*(a1 + a2);  Q = Q + h/2*(b1 + b2);
+            thW(k) = th;  HW(k) = headH(max(Q/(Uq(k+1)*th),3.31));
+        end
+    end
+
+    function [dth,dQ] = wakeRHS(th,Q,Ue,dU)
+        HH1 = max(Q/(Ue*th),3.31);  Hf = headH(HH1);
+        dth = -(2 + Hf)*th/Ue*dU;               % no wall friction in the wake
+        dQ = Ue*0.0306*(HH1 - 3)^(-0.6169);
+    end
+
+    function u = noseU(x)
+        % thin-theory surface speed of the nose term sqrt(x)(1 - x), per
+        % unit sqrt(2r)/pi: 3 + (1-3x)/(2 sqrt x) ln|(1+sqrt x)/(1-sqrt x)|
+        q = sqrt(x);
+        u = 3 + (1 - 3*x)./(2*q).*log(abs((1 + q)./(1 - q)));
     end
 
     function out = blFromPaths(P,c)
@@ -556,9 +943,7 @@ function varargout = profil
         % constant-strength panels cannot hold its 1/sqrt(x) density:
         %   (1/pi) PV int y_N'/(x - xi) dxi
         %     = sqrt(2r)/pi * (3 + (1 - 3x)/(2 sqrt x) ln((1 + sqrt x)/(1 - sqrt x)))
-        sq = sqrt(xm);
-        utC = (Lmat*sigUsr.').'/(2*pi) + kS*U*sqrt(2*rN)/pi* ...
-            (3 + (1 - 3*xm)./(2*sq).*log((1 + sq)./(1 - sq)));
+        utC = (Lmat*sigUsr.').'/(2*pi) + kS*U*sqrt(2*rN)/pi*noseU(xm);
         % downwash on the chord line: panels for the editor part, and the
         % exact uniform -U*alpha of the flat-plate sheet (panels would smear
         % its leading-edge singularity)
@@ -577,9 +962,14 @@ function varargout = profil
 
     function w = wThin(z)
         % source and vortex panels on the chord line, constant density each
+        % (plus, with the boundary layer on, its displacement sources on the
+        % chord and in the wake and the decambering vortices)
         sz = size(z);  z = z(:);
-        s = ((sig + 1i*gam)/(2*pi)).';
+        s = ((sig + sigV + 1i*(gam + gamV))/(2*pi)).';
         w = U + log((z - xe(1:end-1))./(z - xe(2:end)))*s;
+        if any(sigW)
+            w = w + log((z - xwE(1:end-1))./(z - xwE(2:end)))*(sigW/(2*pi)).';
+        end
         w = reshape(w,sz);
     end
 
@@ -668,6 +1058,13 @@ function varargout = profil
             xb = [xe fliplr(xe)];  yb = [ycE + ytE, fliplr(ycE - ytE)];
             set(hBody,'XData',xb,'YData',yb);
             set(hCamber,'XData',xe,'YData',ycE);
+            % viscous-inviscid solution first: it changes the flow field
+            if blOn
+                if dragPt(1) ~= 0 || quick, nIt = 8; else, nIt = VIT; end
+                bl = viscousThin(nIt);
+            else
+                bl = [];  sigV(:) = 0;  gamV(:) = 0;  sigW(:) = 0;
+            end
             if get(cStr,'Value')
                 keep = @(z) boxOK(z) & ~insideThin(z);
                 [x,y] = pf.traceStreamlines(@wThin,zLeft,ones(1,NLEFT),H,NSTEP,keep);
@@ -697,12 +1094,19 @@ function varargout = profil
             if min(ytE) < -1e-3
                 info{end+1} = 'negative thickness: surfaces cross';
             end
-            if blOn
-                bl = boundaryLayerThin();
+            if blOn && bl.fail
+                set([hExU hExL],'Visible','off');
+                set([hBL hTr hSep],'XData',NaN,'YData',NaN);
+                info{end+1} = 'boundary layer: no solution here';
+            elseif blOn
                 set(hStag,'XData',real(bl.zStag),'YData',imag(bl.zStag));
-                info = [info, showBL(CLt)];
+                info = [info, showVII(CLt)];
+                % viscous surface pressure on the "exact" lines
+                set(hExU,'XData',xm,'YData',1 - (bl.qu/U).^2,'Visible','on');
+                set(hExL,'XData',xm,'YData',1 - (bl.ql/U).^2,'Visible','on');
+                hLeg.String(1:2) = {'viscous (VII), upper','viscous (VII), lower'};
             else
-                bl = [];
+                set([hExU hExL],'Visible','off');
             end
             drawEditor();
         end
@@ -745,6 +1149,33 @@ function varargout = profil
             lines{end+1} = sprintf('cd (Squire-Young) = %.5f',bl.cd);
             lines{end+1} = sprintf('L/D = %.0f',CL/bl.cd);
         end
+    end
+
+    function lines = showVII(CLi)
+        % draw the coupled solution held in bl and return its info lines
+        ds = [bl.dsurf{1}, NaN, bl.dsurf{2}, NaN, bl.wake, NaN, bl.wakeL];
+        set(hBL,'XData',real(ds),'YData',imag(ds));
+        set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
+        set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
+        CLv = CLi + bl.dCL;
+        if bl.conv
+            st = sprintf('VII converged, %d it',bl.it);
+        else
+            st = sprintf('VII NOT converged (%.0e)',bl.res);
+        end
+        lines = {sprintf('Re %.3g  %s, %s* x%d',ReN,st,char(948),BLX), ...
+                 sprintf('CL viscous %.4f (inv %.4f)',CLv,CLi), ...
+                 ['transition up ' sideStr(bl.xTr(1),'laminar') ...
+                  ', lo ' sideStr(bl.xTr(2),'laminar')]};
+        if bl.sep
+            sp = {'',''};
+            for k = 1:2
+                sp{k} = sideStr(bl.xSep(k),'att.');
+                if isfinite(bl.xRe(k)), sp{k} = [sp{k} '-' sprintf('%.2f',bl.xRe(k))]; end
+            end
+            lines{end+1} = ['separated up ' sp{1} ', lo ' sp{2}];
+        end
+        lines{end+1} = sprintf('cd (wake) = %.5f   L/D = %.0f',bl.cd,CLv/bl.cd);
     end
 
     function s = sideStr(x,whenNone)
@@ -818,6 +1249,7 @@ function varargout = profil
         isJ = mode == 1;
         set(pnlZ,'Visible',onoff(isJ));  set(pnlE,'Visible',onoff(~isJ));
         set([hExU hExL],'Visible',onoff(isJ));
+        if isJ, hLeg.String(1:2) = {'exact, upper','exact, lower'}; end
         configureSliders();
         configureBottom();
         if isJ
@@ -853,7 +1285,9 @@ function varargout = profil
         end
     end
 
-    function readSliders()
+    function readSliders(fast)
+        if nargin < 1, fast = false; end
+        quick = fast;
         v = [get(hThk,'Value') get(hCmb,'Value') get(hAoa,'Value')];
         if mode == 1
             thk = round(v(1)*1000)/1000;
@@ -868,6 +1302,7 @@ function varargout = profil
         end
         set(hThkV,'String',s{1});  set(hCmbV,'String',s{2});  set(hAoaV,'String',s{3});
         redraw();
+        quick = false;
     end
 
     function apiSetJoukowski(t,c,adeg)
@@ -903,7 +1338,9 @@ function varargout = profil
         end
     end
 
-    function setBottom()
+    function setBottom(fast)
+        if nargin < 1, fast = false; end
+        quick = fast;
         if mode == 1
             tauTE = round(get(hTE,'Value')*2)/2;
         else
@@ -911,6 +1348,7 @@ function varargout = profil
         end
         bottomLabel();
         redraw();
+        quick = false;
     end
 
     function apiSetBL(on,re,bottom)
