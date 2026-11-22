@@ -63,20 +63,10 @@ function varargout = przeplywer
     fig = figure('Name','Przeplywer - potential flow','NumberTitle','off', ...
         'Color','w','MenuBar','none','ToolBar','none', ...
         'Units','pixels','Position',[80 60 1180 800]);
-    try
-        theme(fig,'light');             % colours below assume a light figure
-    catch
-        % releases before R2025a have no figure themes
-    end
     ax = axes('Parent',fig,'Units','normalized','Position',[0.05 0.21 0.86 0.77], ...
         'XLim',XL,'YLim',YL,'DataAspectRatio',[1 1 1],'Box','on','Layer','top');
     hold(ax,'on');
-    try
-        disableDefaultInteractivity(ax);
-        ax.Toolbar.Visible = 'off';
-    catch
-        % older releases have no default axes interactions
-    end
+    pf.prepareFigure(fig,ax);           % light theme, no built-in pan/zoom
 
     [gx,gy] = meshgrid(XL(1):DG:XL(2), YL(1):DG:YL(2));
     gz = gx + 1i*gy;
@@ -197,60 +187,23 @@ function varargout = przeplywer
     % =====================================================================
     function w = conjVel(z)
         % Complex conjugate velocity u - i*v at the points z.
-        w = U + zeros(size(z));
-        for k = 1:numel(ez)
-            d = z - ez(k);
-            w = w + A(k)./d + B(k)./d.^2;
-        end
-    end
-
-    function v = dirn(z)
-        % Unit vector along the flow, as a complex number.
-        w = conjVel(z);
-        v = conj(w)./abs(w);
+        w = pf.poleVelocity(z,U,ez,A,B);
     end
 
     function [x,y] = trace(z0,sg)
-        % Integrate streamlines from seeds z0 (row) by arc length with the
-        % midpoint rule; sg = +1 follows the flow, -1 goes upstream.
-        n = numel(z0);
-        if n == 0, x = NaN; y = NaN; return; end
-        Z = nan(NSTEP+2,n);             % last row stays NaN: line separator
-        Z(1,:) = z0;  z = z0;  alive = true(1,n);
-        for i = 1:NSTEP
-            zm = z + 0.5*H*sg.*dirn(z);
-            z  = z + H*sg.*dirn(zm);
-            z(~alive) = NaN;
-            Z(i+1,:) = z;
-            alive = alive & real(z) >= XL(1)-1e-9 & real(z) <= XL(2) ...
-                          & imag(z) >= YL(1) & imag(z) <= YL(2) ...
-                          & ~any(abs(z - ez.') < RKILL,1);
-            if ~any(alive), break; end
-        end
-        x = real(Z(:));  y = imag(Z(:));
+        % Streamlines from seeds z0 (row); sg = +1 follows the flow, -1 goes
+        % upstream. Lines end at the domain edge and next to an element.
+        zk = ez.';
+        keep = @(z) real(z) >= XL(1)-1e-9 & real(z) <= XL(2) ...
+                  & imag(z) >= YL(1) & imag(z) <= YL(2) ...
+                  & ~any(abs(z - zk) < RKILL,1);
+        [x,y] = pf.traceStreamlines(@conjVel,z0,sg,H,NSTEP,keep);
     end
 
     function zs = stagnation()
-        % Stagnation points: dW/dz = 0 multiplied through by all the
-        % denominators is a polynomial, so ROOTS finds every one of them.
-        zs = zeros(0,1);
-        K = numel(ez);
-        if K == 0, return; end
-        owner = repelem(1:K, 1 + (et == DBL));   % doublets are double poles
-        r = ez(owner);
-        N = numel(r);
-        P = U*poly(r);
-        for k = 1:K
-            if et(k) == DBL
-                t = B(k)*poly(r(owner ~= k));
-            else
-                i1 = find(owner == k,1);
-                t = A(k)*poly(r([1:i1-1, i1+1:N]));
-            end
-            P = P + [zeros(1,N+1-numel(t)), t];
-        end
-        if ~any(P), return; end
-        zs = roots(P);
+        % Stagnation points inside the domain, away from the elements.
+        zs = pf.stagnationPoints(U,ez,A,B,et == DBL);
+        if isempty(zs), return; end
         ok = isfinite(zs) & real(zs) > XL(1) & real(zs) < XL(2) ...
            & imag(zs) > YL(1) & imag(zs) < YL(2) ...
            & all(abs(zs - ez) > 1e-3, 2);
@@ -299,11 +252,7 @@ function varargout = przeplywer
             tFlow = tFlow + DT;
             updateBlink();
             if ~get(cPart,'Value'), return; end
-            hop = @(d) d.*min(1, MAXHOP./max(abs(d),eps));   % cap the step length
-            zm = pz + 0.5*hop(DT*conj(conjVel(pz)));
-            v  = conj(conjVel(zm));
-            dz = hop(DT*v);
-            pz = pz + dz;
+            [pz,v,dz] = pf.advectParticles(pz,@conjVel,DT,MAXHOP);
             if dyeMode
                 % dye is never recycled, otherwise the mixing pattern is lost;
                 % it only vanishes into sinks and doublets (vortices just spin it)
@@ -454,11 +403,8 @@ function varargout = przeplywer
 
         % --- velocity vectors: length follows speed, capped near singularities
         if get(cVec,'Value')
-            w = conjVel(gz);
-            w(~isfinite(w)) = 0;
-            sp = abs(w);  cap = 2*max(U,0.5);
-            sc = 0.9*DG*min(sp,cap)/cap./max(sp,eps);
-            set(hQ,'UData',real(w).*sc,'VData',-imag(w).*sc,'Visible','on');
+            [qu,qv] = pf.cappedArrows(conjVel(gz),2*max(U,0.5),0.9*DG);
+            set(hQ,'UData',qu,'VData',qv,'Visible','on');
         else
             set(hQ,'Visible','off');
         end
