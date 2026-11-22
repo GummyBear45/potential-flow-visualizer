@@ -178,7 +178,8 @@ function varargout = przeplywer
     pAge = floor(rand(1,NPART).*pLife);         % stagger the first generation
     tmr = timer('ExecutionMode','fixedSpacing','Period',0.03,'BusyMode','drop', ...
         'TimerFcn',@tick);
-    set(fig,'DeleteFcn',@(~,~) killTimer());
+    % the handler is in its own file, so closing works even after this file is edited
+    set(fig,'DeleteFcn',{@pf.deleteTimer,tmr});
     start(tmr);
     if nargout, varargout{1} = fig; end
 
@@ -383,13 +384,6 @@ function varargout = przeplywer
         if get(cPart,'Value'), set(hCb,'Visible','on'); end
     end
 
-    function killTimer()
-        try
-            stop(tmr);  delete(tmr);
-        catch
-            % timer already gone
-        end
-    end
 
     % =====================================================================
     %  Drawing

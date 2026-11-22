@@ -15,7 +15,12 @@ function varargout = profil
 %     thickness follows from sigma, the camber line from gamma
 %         y_t(x) = 1/(2U) * int_0^x sigma,
 %         dy_c/dx = v_gamma(x)/U,  v_gamma = -(1/2pi) PV int gamma/(x - xi).
-%     The last gamma point is locked at 0 (Kutta condition).
+%     The last gamma point is locked at 0 (Kutta condition). The theory is
+%     linear, so the sliders scale sigma (thickness) and gamma (camber)
+%     directly; the angle of attack adds the exact flat-plate sheet
+%     gamma = 2 U alpha sqrt((1-x)/x), whose downwash is a uniform -U alpha.
+%     "Keep body closed" shifts the other source points while one is
+%     dragged, so that int sigma = 0.
 %
 %   Pressure coefficient
 %     The right-hand plot shows -Cp along the chord. In thin airfoil theory
@@ -49,7 +54,8 @@ function varargout = profil
     mode = 1;                               % 1 Joukowski, 2 thin airfoil
     thk = 0.12;  cmb = 0.06;  aoa = deg2rad(5);
     mu = 0;  a = b;  betaK = 0;  Gam = 0;  Uc = U;  Ap = 0;  Bp = 0;
-    sc = zeros(size(XC));  gc = zeros(size(XC));
+    sc = zeros(size(XC));  gc = zeros(size(XC));   % editor shapes (before scaling)
+    kS = 1;  kG = 1;  aoaT = 0;             % thin mode: thickness/camber scale, AoA
     sig = zeros(1,NPAN);  gam = sig;  ytE = zeros(1,NPAN+1);  ycE = ytE;
     info = {};
     pz = zeros(1,0);  pAge = pz;  pLife = pz;
@@ -130,6 +136,10 @@ function varargout = profil
     xf = linspace(0,1,300);
     hEs = line('Parent',axE,'XData',xf,'YData',0*xf,'Color',[0.84 0.22 0.18],'LineWidth',1.6,np{:});
     hEg = line('Parent',axE,'XData',xf,'YData',0*xf,'Color',[0.2 0.6 0.3],'LineWidth',1.6,np{:});
+    hEa = line('Parent',axE,'XData',xf,'YData',NaN*xf,'Color',[0.55 0.30 0.75], ...
+        'LineStyle','--','LineWidth',1.3,np{:});
+    text(axE,0.45,2.45,'dashed: AoA part of \gamma (exact)','FontSize',9, ...
+        'Color',[0.55 0.30 0.75],np{:});
     hEsp = line('Parent',axE,'XData',XC,'YData',sc,'LineStyle','none','Marker','o','MarkerSize',8, ...
         'MarkerFaceColor',[0.84 0.22 0.18],'MarkerEdgeColor','k',np{:});
     hEgp = line('Parent',axE,'XData',XC(1:end-1),'YData',gc(1:end-1),'LineStyle','none', ...
@@ -166,9 +176,10 @@ function varargout = profil
     val = @(y) uicontrol(fig,'Style','text','String','','Units','normalized', ...
         'Position',[0.345 y 0.06 0.03],'BackgroundColor','w','FontSize',10, ...
         'HorizontalAlignment','left');
-    lbl(['thickness  ' char(949) '/b'],0.245);   hThk = sld(0,0.3,thk,0.245);  hThkV = val(0.245);
-    lbl(['camber  ' char(948) '/b'],0.200);      hCmb = sld(-0.15,0.3,cmb,0.200); hCmbV = val(0.200);
-    lbl('angle of attack [deg]',0.155);           hAoa = sld(-10,15,rad2deg(aoa),0.155); hAoaV = val(0.155);
+    % the same three sliders serve both modes; setMode relabels them
+    hL1 = lbl('',0.245);  hThk = sld(0,0.3,thk,0.245);  hThkV = val(0.245);
+    hL2 = lbl('',0.200);  hCmb = sld(-0.15,0.3,cmb,0.200); hCmbV = val(0.200);
+    hL3 = lbl('',0.155);  hAoa = sld(-10,15,rad2deg(aoa),0.155); hAoaV = val(0.155);
     for h = [hThk hCmb hAoa]
         set(h,'Callback',@(~,~) readSliders());
         addlistener(h,'ContinuousValueChange',@(~,~) readSliders());
@@ -179,7 +190,6 @@ function varargout = profil
     btn('Symmetric',0.04,0.075,@(~,~) preset(1));
     btn('Cambered',0.12,0.075,@(~,~) preset(2));
     btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3));
-    btn(['Close body (' char(8747) char(963) ' = 0)'],0.28,0.12,@(~,~) closeBody());
 
     hInfo = uicontrol(fig,'Style','text','Units','normalized','Position',[0.41 0.10 0.19 0.19], ...
         'BackgroundColor',[0.97 0.97 0.97],'FontSize',9,'HorizontalAlignment','left', ...
@@ -192,7 +202,7 @@ function varargout = profil
         'WindowButtonUpFcn',@onUp);
 
     setappdata(fig,'api',struct('setMode',@setMode,'setJoukowski',@apiSetJoukowski, ...
-        'setControls',@apiSetControls,'preset',@preset,'closeBody',@closeBody, ...
+        'setThin',@apiSetThin,'setControls',@apiSetControls,'preset',@preset, ...
         'velocity',@physVel,'state',@getState,'cp',@getCp,'tick',@tick));
 
     preset(2);
@@ -201,7 +211,8 @@ function varargout = profil
     pAge = floor(rand(1,NPART).*pLife);
     tmr = timer('ExecutionMode','fixedSpacing','Period',0.03,'BusyMode','drop', ...
         'TimerFcn',@tick);
-    set(fig,'DeleteFcn',@(~,~) killTimer());
+    % the handler is in its own file, so closing works even after this file is edited
+    set(fig,'DeleteFcn',{@pf.deleteTimer,tmr});
     start(tmr);
     if nargout, varargout{1} = fig; end
 
@@ -291,10 +302,18 @@ function varargout = profil
 
     function solveDistributions()
         % shape from user distributions (freestream along x)
-        sig = U*pchip(XC,sc,xm);
-        gam = U*pchip(XC,gc,xm);
+        % thin theory is linear: scaling sigma scales the thickness, scaling
+        % gamma scales the camber; the AoA adds the exact flat-plate sheet,
+        % leading-edge singularity included
+        lead = (1 + cos(thm))./sin(thm);
+        sig = kS*U*pchip(XC,sc,xm);
+        gUser = kG*U*pchip(XC,gc,xm);
+        gam = gUser + 2*U*aoaT*lead;
         ytE = [0 cumsum(sig.*dxp)]/(2*U);
-        v = -(Lmat*gam.').'/(2*pi);              % downwash on the chord line
+        % downwash on the chord line: panels for the editor part, and the
+        % exact uniform -U*alpha of the flat-plate sheet (panels would smear
+        % its leading-edge singularity)
+        v = -(Lmat*gUser.').'/(2*pi) - U*aoaT;
         ycE = [0 cumsum(v.*dxp)]/U;
     end
 
@@ -419,7 +438,7 @@ function varargout = profil
                     '', ...
                     'thin theory only'};
             if abs(2*ytE(end)) > 0.002
-                info{7} = 'body open: press Close body';
+                info{7} = 'body open: tick Keep body closed';
             end
             if min(ytE) < -1e-3
                 info{8} = 'negative thickness: surfaces cross';
@@ -449,8 +468,11 @@ function varargout = profil
     end
 
     function drawEditor()
-        set(hEs,'YData',pchip(XC,sc,xf));  set(hEg,'YData',pchip(XC,gc,xf));
-        set(hEsp,'YData',sc);  set(hEgp,'YData',gc(1:end-1));
+        % the actual (scaled) densities; dragging edits the shape behind them
+        set(hEs,'YData',kS*pchip(XC,sc,xf));  set(hEg,'YData',kG*pchip(XC,gc,xf));
+        set(hEsp,'YData',kS*sc);  set(hEgp,'YData',kG*gc(1:end-1));
+        ga = 2*aoaT*sqrt((1 - xf)./xf);  ga(1) = NaN;
+        set(hEa,'YData',ga);
     end
 
     function s = onoff(tf)
@@ -499,13 +521,6 @@ function varargout = profil
         end
     end
 
-    function killTimer()
-        try
-            stop(tmr);  delete(tmr);
-        catch
-            % timer already gone
-        end
-    end
 
     % =====================================================================
     %  Controls
@@ -515,8 +530,8 @@ function varargout = profil
         set(hMode,'Value',m);
         isJ = mode == 1;
         set(pnlZ,'Visible',onoff(isJ));  set(pnlE,'Visible',onoff(~isJ));
-        set([hThk hCmb hAoa],'Enable',onoff(isJ));
         set([hExU hExL],'Visible',onoff(isJ));
+        configureSliders();
         if isJ
             set(hHint,'String',['Joukowski: the circle plane (bottom right) holds a ' ...
                 'freestream, a doublet and a vortex, exactly like przeplywer. ' ...
@@ -526,26 +541,60 @@ function varargout = profil
                 'To shape an airfoil with sources and vortices, pick a preset or switch Mode.']);
         else
             set(hHint,'String',['Thin airfoil: drag the red source points (thickness) and ' ...
-                'green vortex points (camber and lift). The airfoil shape follows. ' ...
-                'Freestream is along x, so the angle of attack is the tilt of the chord. ' ...
-                'Cp is linear theory: the three parts add up exactly to the dashed total.']);
+                'green vortex points (camber). The sliders scale the two distributions ' ...
+                'linearly, and the angle of attack adds the exact flat-plate vortex sheet, ' ...
+                'so the airfoil turns nose-up in the horizontal freestream. Cp is linear ' ...
+                'theory: the three parts add up exactly to the dashed total.']);
         end
         readSliders();
         if ~isempty(pz), respawn(true(1,NPART)); end
     end
 
+    function configureSliders()
+        % labels, ranges and values of the three sliders for the current mode
+        if mode == 1
+            cfg = {['thickness  ' char(949) '/b'],[0 0.3],thk;
+                   ['camber  ' char(948) '/b'],[-0.15 0.3],cmb;
+                   'angle of attack [deg]',[-10 15],rad2deg(aoa)};
+        else
+            cfg = {['thickness scale (' char(963) ')'],[0 3],kS;
+                   ['camber scale (' char(947) ')'],[-2 3],kG;
+                   'angle of attack [deg]',[-10 15],rad2deg(aoaT)};
+        end
+        hs = [hThk hCmb hAoa];  hl = [hL1 hL2 hL3];
+        for k = 1:3
+            set(hl(k),'String',cfg{k,1});
+            set(hs(k),'Min',-1e9,'Max',1e9);        % widen first: no range warning
+            set(hs(k),'Value',cfg{k,3},'Min',cfg{k,2}(1),'Max',cfg{k,2}(2));
+        end
+    end
+
     function readSliders()
-        thk = round(get(hThk,'Value')*1000)/1000;
-        cmb = round(get(hCmb,'Value')*1000)/1000;
-        aoa = deg2rad(round(get(hAoa,'Value')*10)/10);
-        set(hThkV,'String',sprintf('%.3f',thk));
-        set(hCmbV,'String',sprintf('%.3f',cmb));
-        set(hAoaV,'String',sprintf('%.1f',rad2deg(aoa)));
+        v = [get(hThk,'Value') get(hCmb,'Value') get(hAoa,'Value')];
+        if mode == 1
+            thk = round(v(1)*1000)/1000;
+            cmb = round(v(2)*1000)/1000;
+            aoa = deg2rad(round(v(3)*10)/10);
+            s = {sprintf('%.3f',thk), sprintf('%.3f',cmb), sprintf('%.1f',rad2deg(aoa))};
+        else
+            kS = round(v(1)*100)/100;
+            kG = round(v(2)*100)/100;
+            aoaT = deg2rad(round(v(3)*10)/10);
+            s = {sprintf('x %.2f',kS), sprintf('x %.2f',kG), sprintf('%.1f',rad2deg(aoaT))};
+        end
+        set(hThkV,'String',s{1});  set(hCmbV,'String',s{2});  set(hAoaV,'String',s{3});
         redraw();
     end
 
     function apiSetJoukowski(t,c,adeg)
+        if mode ~= 1, setMode(1); end
         set(hThk,'Value',t);  set(hCmb,'Value',c);  set(hAoa,'Value',adeg);
+        readSliders();
+    end
+
+    function apiSetThin(ks,kg,adeg)
+        if mode ~= 2, setMode(2); end
+        set(hThk,'Value',ks);  set(hCmb,'Value',kg);  set(hAoa,'Value',adeg);
         readSliders();
     end
 
@@ -559,16 +608,15 @@ function varargout = profil
         xx = max(XC,0.004);
         dyt = 0.6*(0.2969*0.5./sqrt(xx) - 0.126 - 2*0.3516*xx + 3*0.2843*xx.^2 ...
             - 4*0.1036*xx.^3);                   % NACA 0012 thickness slope
+        kS = 1;  kG = 1;  aoaT = 0;
         switch k
             case 1
                 sc = 2*dyt;  gc = zeros(size(XC));
             case 2
                 sc = 2*dyt;  gc = 16*0.04*sqrt(XC.*(1 - XC));   % parabolic camber, 4 %
             otherwise
-                sc = zeros(size(XC));
-                % flat plate at 5 deg; the finite control points cut off the
-                % leading-edge singularity, which droops the nose slightly
-                gc = 2*deg2rad(5)*sqrt((1 - XC)./xx);
+                sc = zeros(size(XC));  gc = zeros(size(XC));    % flat plate ...
+                aoaT = deg2rad(5);                               % ... at 5 deg
         end
         gc(end) = 0;
         if get(cClose,'Value'), keepClosed(0); end
@@ -597,19 +645,12 @@ function varargout = profil
 
     function showThin()
         % the distribution buttons work from either mode
-        if mode == 2, redraw(); else, setMode(2); end
-    end
-
-    function closeBody()
-        % remove the net source strength with a correction growing like x^2,
-        % so the nose shape is hardly touched
-        xq = linspace(0,1,2001);
-        for it = 1:4
-            I = trapz(xq,pchip(XC,sc,xq));
-            Iw = trapz(xq,pchip(XC,XC.^2,xq));
-            sc = sc - I/Iw*XC.^2;
+        if mode == 2
+            configureSliders();
+            readSliders();
+        else
+            setMode(2);
         end
-        showThin();
     end
 
     function s = getState()
@@ -634,8 +675,8 @@ function varargout = profil
         yl = get(axE,'YLim');
         if p(1) < 0 || p(1) > 1 || p(2) < yl(1) || p(2) > yl(2), return; end
         ys = diff(yl);
-        ds = hypot(XC - p(1),(sc - p(2))/ys);
-        dg = hypot(XC(1:end-1) - p(1),(gc(1:end-1) - p(2))/ys);
+        ds = hypot(XC - p(1),(kS*sc - p(2))/ys);
+        dg = hypot(XC(1:end-1) - p(1),(kG*gc(1:end-1) - p(2))/ys);
         [m1,i1] = min(ds);  [m2,i2] = min(dg);
         if min(m1,m2) > PICK, return; end
         if m1 <= m2, dragPt = [1 i1]; else, dragPt = [2 i2]; end
@@ -648,11 +689,12 @@ function varargout = profil
             cp = get(axE,'CurrentPoint');
             yl = get(axE,'YLim');
             v = min(max(cp(1,2),yl(1)),yl(2));
-            if dragPt(1) == 1
-                sc(dragPt(2)) = v;
+            % a point at scale 0 cannot be moved: there is nothing to scale
+            if dragPt(1) == 1 && abs(kS) > 1e-3
+                sc(dragPt(2)) = v/kS;
                 if get(cClose,'Value'), keepClosed(dragPt(2)); end
-            else
-                gc(dragPt(2)) = v;
+            elseif dragPt(1) == 2 && abs(kG) > 1e-3
+                gc(dragPt(2)) = v/kG;
             end
             redraw();
             drawnow limitrate
