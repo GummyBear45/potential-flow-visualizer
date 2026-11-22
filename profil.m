@@ -154,6 +154,9 @@ function varargout = profil
     cStr = chk('Streamlines',[0.37 0.30 0.09 0.035]);
     cPart = chk('Particles',[0.46 0.30 0.08 0.035]);
     cComp = chk('Cp components',[0.04 0.06 0.12 0.035]);
+    cClose = uicontrol(fig,'Style','checkbox','String','Keep body closed','Value',1, ...
+        'Units','normalized','Position',[0.04 0.02 0.12 0.035],'BackgroundColor','w', ...
+        'FontSize',10,'Callback',@(~,~) toggleClosed());
 
     lbl = @(s,y) uicontrol(fig,'Style','text','String',s,'Units','normalized', ...
         'Position',[0.04 y 0.13 0.03],'BackgroundColor','w','FontSize',10, ...
@@ -418,6 +421,9 @@ function varargout = profil
             if abs(2*ytE(end)) > 0.002
                 info{7} = 'body open: press Close body';
             end
+            if min(ytE) < -1e-3
+                info{8} = 'negative thickness: surfaces cross';
+            end
             drawEditor();
         end
         set(hInfo,'String',info);
@@ -545,6 +551,7 @@ function varargout = profil
 
     function apiSetControls(s,g)
         sc = s;  gc = g;  gc(end) = 0;
+        if get(cClose,'Value'), keepClosed(0); end
         redraw();
     end
 
@@ -564,7 +571,28 @@ function varargout = profil
                 gc = 2*deg2rad(5)*sqrt((1 - XC)./xx);
         end
         gc(end) = 0;
+        if get(cClose,'Value'), keepClosed(0); end
         showThin();
+    end
+
+    function keepClosed(fixedIdx)
+        % Make the net source strength zero by shifting every source point
+        % by the same amount, except the dragged one (FIXEDIDX) and the
+        % leading-edge point, which shapes the nose. PCHIP is not linear in
+        % the point values, so the shift is refined a few times.
+        free = true(size(XC));  free(1) = false;
+        if fixedIdx > 0, free(fixedIdx) = false; end
+        xq = linspace(0,1,2001);
+        Ifree = trapz(xq,pchip(XC,double(free),xq));
+        for it = 1:4
+            I = trapz(xq,pchip(XC,sc,xq));
+            sc(free) = sc(free) - I/Ifree;
+        end
+    end
+
+    function toggleClosed()
+        if get(cClose,'Value'), keepClosed(0); end
+        redraw();
     end
 
     function showThin()
@@ -620,7 +648,12 @@ function varargout = profil
             cp = get(axE,'CurrentPoint');
             yl = get(axE,'YLim');
             v = min(max(cp(1,2),yl(1)),yl(2));
-            if dragPt(1) == 1, sc(dragPt(2)) = v; else, gc(dragPt(2)) = v; end
+            if dragPt(1) == 1
+                sc(dragPt(2)) = v;
+                if get(cClose,'Value'), keepClosed(dragPt(2)); end
+            else
+                gc(dragPt(2)) = v;
+            end
             redraw();
             drawnow limitrate
         catch err
