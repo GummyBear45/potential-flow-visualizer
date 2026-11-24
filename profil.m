@@ -60,6 +60,7 @@ function varargout = profil
     NW = 40;  LW = 1.5;                     % wake panels and length [chords]
     VIT = 150;  OMG = 0.5;  VTOL = 5e-3;    % iterations, relaxation, tolerance
     HSW = 2.0;                              % shape factor where the march turns inverse
+    NCRIT = 9;                              % e^N transition: critical amplification (XFOIL default)
     XCPL = 0.96;                            % coupling stops here (TE singularity of linear theory)
     xwE = 1 + LW*linspace(0,1,NW+1).^1.6;  xwM = (xwE(1:end-1) + xwE(2:end))/2;
     dxw = diff(xwE);
@@ -429,6 +430,14 @@ function varargout = profil
         rA = kS^2*rN;  c = hypot(1,ycE(end));  nu = U*c/ReN;
         % Lighthill-Van Dyke leading-edge correction factors
         Fm = sqrt(xm./(xm + rA/2));  Gm = sqrt((1 - xm)./(xm + rA/2));
+        % second order: the lifting part of the speed is carried by the
+        % local thickness flow, q = U(1 + u_t/U)(1 + q_lift/U) to first order
+        % in each; exact for an ellipse at any angle, and it gives the
+        % thickness gain in lift slope (about 1 + 0.77 t/c)
+        fac = min(max(1 + utC/U,0.5),2);
+        quI = U*((1 + utC/U).*Fm + fac.*(gUsr/(2*U).*Fm + aoaT*Gm));
+        qlI = U*((1 + utC/U).*Fm - fac.*(gUsr/(2*U).*Fm + aoaT*Gm));
+        cpInt = @(qa,qb) sum((qa.^2 - qb.^2).*dxp)/(U^2*hypot(1,ycE(end)));
         lead = (1 + cos(thm))./sin(thm);  nn = (1:NFOU).';
         utW0 = (Lwa*sigUsr.').'/(2*pi) + kS*U*sqrt(2*rN)/pi*noseU(xwM);
         if isempty(vs) || ~all(isfinite([vs.dsU vs.dsL vs.dsW vs.UeU vs.UeL vs.UeW]))
@@ -436,7 +445,7 @@ function varargout = profil
                 'UeU',U*ones(1,NPAN),'UeL',U*ones(1,NPAN),'UeW',U*ones(1,NW),'cold',true, ...
                 'turb',false(2,NPAN),'aoa',NaN);
         end
-        prev = vs;  xTrFix = [NaN NaN];  jFix = NaN;
+        prev = vs;  xTrFix = [NaN NaN];  xLSFix = [NaN NaN];  xSwFix = [inf inf];  jFix = NaN;
         om = OMG;  best = inf;  retries = 0;     % relaxation, cut only when diverging
         res = inf;  it = 0;  rW = 0;  hist = nan(1,maxIt);
         while it < maxIt
@@ -449,8 +458,8 @@ function varargout = profil
             dA0 = -(1/pi)*sum(dS)*dth;
             dAn = (2/pi)*sum(dS.*cos(nn*thm),2)*dth;
             dgc = 2*U*sum(dAn.*sin(nn*thm),1);
-            qu = U*((1 + (utC + dut)/U + (gUsr + dgc)/(2*U)).*Fm + (aoaT + dA0)*Gm);
-            ql = U*((1 + (utC + dut)/U - (gUsr + dgc)/(2*U)).*Fm - (aoaT + dA0)*Gm);
+            qu = U*((1 + (utC + dut)/U).*Fm + fac.*((gUsr + dgc)/(2*U).*Fm + (aoaT + dA0)*Gm));
+            ql = U*((1 + (utC + dut)/U).*Fm - fac.*((gUsr + dgc)/(2*U).*Fm + (aoaT + dA0)*Gm));
             UeWi = U + utW0 + dutW;
 
             % --- boundary layer from the stagnation point along both surfaces
@@ -469,7 +478,7 @@ function varargout = profil
                     v = dsS(ii);  v(~vs.turb(ii)) = NaN;
                     dsP(on) = v;
                 end
-                r{k} = marchVII(s,max(p.Ue,1e-9),dsP,nu,p.x,xTrFix(k));
+                r{k} = marchVII(s,max(p.Ue,1e-9),dsP,nu,p.x,[xTrFix(k) xLSFix(k)],xSwFix(k));
                 rr = r{k};
                 % new delta*: direct stations (laminar, attached turbulent)
                 % under-relaxed towards the march, inverse stations by Carter
@@ -483,7 +492,7 @@ function varargout = profil
                 omLoc = min(om,dsl./(pi*max(rr.dstar,1e-6)));
                 dirK = 1:min(rr.ksw - 1,numel(s));
                 inC = p.x <= XCPL;                   % stations taking part in the coupling
-                okD = dirK(isfinite(old(dirK)) & dirK > rr.itr + 2 & ~vs.cold & inC(dirK));
+                okD = dirK(isfinite(old(dirK)) & dirK > 3 & ~vs.cold & inC(dirK));
                 if ~isempty(okD)
                     rD = max(abs(dnew(okD) - old(okD)))/max(max(dnew(okD)),1e-9);
                     res = max(res,rD);
@@ -512,7 +521,12 @@ function varargout = profil
                 UeS(ii) = rr.UeB(on);
                 tb = false(size(p.x));  tb(rr.itr:end) = rr.itr < numel(p.x);
                 turbN(ii) = tb(on);
-                if it == 5, xTrFix(k) = p.x(rr.itr); end   % freeze transition
+                if it == 5                          % freeze transition and laminar separation
+                    xTrFix(k) = p.x(rr.itr);  xLSFix(k) = rr.xLS;
+                end
+                % freeze the direct/inverse switch as well: a station flipping
+                % between the two modes keeps the iteration from settling
+                if it == 8 && rr.ksw <= numel(s), xSwFix(k) = p.x(rr.ksw); end
                 % stations past x/c = 0.99 are not marched: hold the last value
                 last = find(on,1,'last');
                 rest = p.id(last)+1:NPAN;
@@ -570,7 +584,7 @@ function varargout = profil
         end
         r = G.r;  P = G.P;  zs = G.zs;  qu = G.qu;  ql = G.ql;  thW = G.thW;  HW = G.HW;
         UeWi = G.UeWi;  sa = G.sa;  sw = G.sw;
-        dA0 = G.dA0;  dAn = G.dAn;  dgc = G.dgc;
+        dA0 = G.dA0;  dgc = G.dgc;
 
         % viscous corrections kept for the flow field
         sigV = sa;  sigW = sw;  gamV = 2*U*dA0*lead + dgc;
@@ -578,7 +592,7 @@ function varargout = profil
         % results for drawing and the info box
         if res < 0.02, vs.aoa = aoaT; else, vs.aoa = NaN; end   % for continuation
         out = struct('fail',false,'cd',0,'sep',false,'it',it,'res',res,'conv',res < VTOL, ...
-            'qu',qu,'ql',ql,'zStag',zs,'dCL',pi*(2*dA0 + dAn(1)));
+            'qu',qu,'ql',ql,'zStag',zs,'CL',cpInt(qu,ql),'CLi',cpInt(quI,qlI));
         for k = 1:2
             p = P{k};  rr = r{k};
             T = gradient(p.z);  nrm = (3 - 2*k)*1i*T./abs(T);
@@ -664,35 +678,60 @@ function varargout = profil
         end
     end
 
-    function r = marchVII(s,Ue,dsP,nu,xp,xTrFix)
-        % Laminar: Thwaites (direct) up to Michel transition or laminar
-        % separation; with xTrFix given, transition is held at that x.
+    function r = marchVII(s,Ue,dsP,nu,xp,xFix,xSwFix)
+        % Laminar: Thwaites (direct) up to e^N transition (N = NCRIT) or
+        % laminar separation; with xTrFix given, transition is held at that x.
         % Turbulent: Head's momentum and entrainment equations, inverse
         % (delta* = dsP given, Ue solved) once dsP is known, direct on the
         % first pass.
         n = numel(s);
         theta = nan(1,n);  Hf = theta;  UeB = Ue;
         dU = gradient(Ue,s);
-        dUs = gradient(movmean(Ue,5),s);         % pressure gradient seen by lambda
+        dUs = gradient(movmean(Ue,9),s);         % pressure gradient seen by lambda
         m3 = min(3,n);  dUs(1:m3) = dU(1:m3);
         I = cumtrapz(s,Ue.^5);
         th2 = 0.45*nu*I./Ue.^6;
         th2(1) = 0.075*nu/max(dU(1),1e-9);
-        itr = n;
+        xTrFix = xFix(1);  xLSFix = xFix(2);  frozen = isfinite(xTrFix);
+        itr = n;  Namp = 0;  dNprev = 0;  sLS = NaN;  xLS = inf;   % sLS: laminar separation
         for k = 1:n
             theta(k) = sqrt(th2(k));
             lam = th2(k)/nu*dUs(k);
             Hf(k) = thwaitesHL(lam);
-            ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
-            if isfinite(xTrFix)
+            ReT = Ue(k)*theta(k)/nu;
+            % e^N: amplification of the most unstable Tollmien-Schlichting
+            % waves, integrated along the surface (Drela-Giles envelope).
+            % Past laminar separation (lambda < -0.09) the layer goes on as a
+            % free shear layer whose H climbs quickly (here from 3.55 to 7
+            % over about 0.06 chord), and the waves grow much faster.
+            if isnan(sLS) && k > 3 && (frozen && xp(k) >= xLSFix || ~frozen && lam < -0.09)
+                sLS = s(k);  xLS = xp(k);
+            end
+            Hamp = Hf(k);
+            if isfinite(sLS)
+                Hamp = min(3.55 + 60*(s(k) - sLS),7);
+                % no laminar recovery inside the bubble: H stays at its
+                % separation value (Thwaites' lambda past separation would
+                % make delta* follow every wiggle of the local gradient)
+                Hf(k) = thwaitesHL(-0.09);
+            end
+            dN = enRate(Hamp,ReT,theta(k));
+            if k > 1, Namp = Namp + 0.5*(dNprev + dN)*(s(k) - s(k-1)); end
+            dNprev = dN;
+            if frozen
                 % frozen: no laminar-separation override, or transition
                 % flickers between two stations and the iteration never settles
                 go = k > 3 && xp(k) >= xTrFix;
             else
-                go = k > 3 && (ReT > 1.174*(1 + 22400/ReS)*ReS^0.46 || lam < -0.09);
+                % Transition at N = Ncrit; after laminar separation this
+                % happens inside a short bubble, as in XFOIL. The bubble is
+                % not allowed to grow beyond 0.1 chord.
+                go = k > 3 && (Namp >= NCRIT || (isfinite(sLS) && (s(k) - sLS > 0.1 || xp(k) >= XCPL - 0.02)));
             end
             if go, itr = k;  break, end
         end
+        trWhy = 0;                                % 1: e^N, 2: bubble limit, +10: after laminar separation
+        if itr < n, trWhy = 1 + (Namp < NCRIT) + 10*isfinite(sLS); end
         isep = 0;  ireat = 0;  ksw = n + 1;  dsUsed = nan(1,n);
         if itr < n
             % --- turbulent, direct (outer speed prescribed) while attached
@@ -703,7 +742,9 @@ function varargout = profil
                 [e1,e2] = headRHS(th + h*d1,Q + h*d2,Ue(k+1),dU(k+1),nu);
                 thN = th + h/2*(d1 + e1);  QN = Q + h/2*(d2 + e2);
                 HN = headH(max(QN/(Ue(k+1)*thN),3.31));
-                if HN > HSW || ~isfinite(HN), ksw = k + 1;  break, end
+                if HN > HSW || ~isfinite(HN) || (xp(k+1) >= xSwFix && isfinite(dsP(k+1)))
+                    ksw = k + 1;  break
+                end
                 th = thN;  Q = QN;  theta(k+1) = th;  Hf(k+1) = HN;
             end
             % --- turbulent, inverse (delta* prescribed) once H passes HSW:
@@ -742,8 +783,26 @@ function varargout = profil
                 if ~isempty(t2), ireat = isep + t2 - 1; end
             end
         end
-        r = struct('theta',theta,'H',Hf,'dstar',Hf.*theta,'UeB',UeB, ...
-            'itr',itr,'isep',isep,'ireat',ireat,'ksw',ksw,'dsUsed',dsUsed);
+        r = struct('xLS',xLS,'theta',theta,'H',Hf,'dstar',Hf.*theta,'UeB',UeB, ...
+            'itr',itr,'isep',isep,'ireat',ireat,'ksw',ksw,'dsUsed',dsUsed, ...
+            'trWhy',trWhy,'Ntr',Namp);
+    end
+
+    function dNdx = enRate(Hk,ReT,th)
+        % Growth rate dN/ds of the envelope e^N method (Drela and Giles,
+        % AIAA J. 25, 1987, as in XFOIL). Waves grow only above the
+        % critical Re_theta0(H), switched on smoothly over +-0.08 in log10.
+        Hk = max(Hk,1.05);
+        hm = 1/(Hk - 1);
+        lgRe0 = (1.415*hm - 0.489)*tanh(20*hm - 12.9) + 3.295*hm + 0.44;
+        rn = (log10(max(ReT,1)) - (lgRe0 - 0.08))/0.16;
+        if rn <= 0, dNdx = 0;  return, end
+        ramp = 1;
+        if rn < 1, ramp = 3*rn^2 - 2*rn^3; end
+        dNdRe = 0.01*sqrt((2.4*Hk - 3.7 + 2.5*tanh(1.5*Hk - 4.65))^2 + 0.25);
+        el = (6.54*Hk - 14.07)/Hk^2;
+        em = (0.058*(Hk - 4)^2/(Hk - 1) - 0.068)/el;
+        dNdx = ramp*dNdRe*0.5*(em + 1)*el/th;
     end
 
     function [dth,dU] = invRHS(th,Ub,ds,dds,nu)
@@ -1047,7 +1106,7 @@ function varargout = profil
                 info{end+1} = 'boundary layer: no solution here';
             elseif blOn
                 set(hStag,'XData',real(bl.zStag),'YData',imag(bl.zStag));
-                info = [info, showVII(CLt)];
+                info = [info, showVII()];
                 % viscous surface pressure on the "exact" lines
                 set(hExU,'XData',xm,'YData',1 - (bl.qu/U).^2,'Visible','on');
                 set(hExL,'XData',xm,'YData',1 - (bl.ql/U).^2,'Visible','on');
@@ -1079,13 +1138,13 @@ function varargout = profil
         set(hP,'Visible',onoff(get(cPart,'Value')));
     end
 
-    function lines = showVII(CLi)
+    function lines = showVII()
         % draw the coupled solution held in bl and return its info lines
         ds = [bl.dsurf{1}, NaN, bl.dsurf{2}, NaN, bl.wake, NaN, bl.wakeL];
         set(hBL,'XData',real(ds),'YData',imag(ds));
         set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
         set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
-        CLv = CLi + bl.dCL;
+        CLv = bl.CL;  CLi = bl.CLi;
         if bl.conv
             st = sprintf('VII converged, %d it',bl.it);
         else
@@ -1396,7 +1455,7 @@ function varargout = profil
                 if o.fail
                     R(k,:) = [alist(k), rad2deg(-atan(ycE(end))), CLi, NaN(1,5), 0];
                 else
-                    R(k,:) = [alist(k), rad2deg(-atan(ycE(end))), CLi, CLi + o.dCL, o.cd, ...
+                    R(k,:) = [alist(k), rad2deg(-atan(ycE(end))), o.CLi, o.CL, o.cd, ...
                         o.xTr(1), o.xTr(2), o.xSep(1), o.conv || o.res < 0.02];
                 end
             end
