@@ -229,6 +229,7 @@ function varargout = profil
     btn('Symmetric',0.04,0.075,@(~,~) preset(1));
     btn('Cambered',0.12,0.075,@(~,~) preset(2));
     btn('Plate, 5 deg',0.20,0.075,@(~,~) preset(3));
+    btn('Polar...',0.28,0.075,@(~,~) askPolar());
 
     % boundary layer (both modes); the slider below is the trailing-edge
     % angle in Joukowski mode and the nose radius in thin-airfoil mode
@@ -260,6 +261,7 @@ function varargout = profil
 
     setappdata(fig,'api',struct('setMode',@setMode,'setJoukowski',@apiSetJoukowski, ...
         'setThin',@apiSetThin,'setBL',@apiSetBL,'setControls',@apiSetControls,'preset',@preset, ...
+        'polar',@makePolar, ...
         'velocity',@physVel,'state',@getState,'cp',@getCp,'tick',@tick));
 
     preset(2);
@@ -295,9 +297,6 @@ function varargout = profil
         w = pf.poleVelocity(zeta,Uc,mu,Ap,Bp);
     end
 
-    % Karman-Trefftz map  (z - n b)/(z + n b) = ((zeta - b)/(zeta + b))^n.
-    % Written through t = ((zeta - b)/(zeta + b))^n, whose branch cut lies
-    % inside the circle, so the map is smooth everywhere in the flow.
     function z = fmap(zeta)
         t = ((zeta - b)./(zeta + b)).^nKT;
         z = nKT*b*(1 + t)./(1 - t) + X0;
@@ -355,25 +354,34 @@ function varargout = profil
     end
 
     % =====================================================================
-    %  Boundary layer: Thwaites (laminar), Michel (transition), Head
-    %  (turbulent), Squire-Young (profile drag). Edge speed = exact surface
-    %  speed of the potential flow; no feedback on the outer flow.
+    %  Boundary layer (thin-airfoil mode): Thwaites (laminar), Michel
+    %  (transition), Head (turbulent), Squire-Young (profile drag)
     % =====================================================================
-    function out = boundaryLayer(geo,zF)
-        % Joukowski mode: edge speed = exact surface speed
-        [~,iS] = min(abs(geo.zeta - zF));       % front stagnation point
-        N = numel(geo.z);
-        % stop a little short of the trailing edge, where the inviscid
-        % speed of a finite-angle edge drops to zero (a real wake does not)
-        stopAt = 0.99;
-        paths = {iS:-1:1, iS:N};                 % upper (towards TE first), lower
-        P = cell(1,2);
-        for k = 1:2
-            idx = paths{k};
-            idx = idx(1:find(geo.x(idx) <= stopAt | (1:numel(idx)) <= 3,1,'last'));
-            P{k} = struct('z',geo.z(idx),'x',geo.x(idx),'Ue',geo.V(idx));
+    function [wU,wL] = wakeEdges(zEndU,zEndL,dU0,dL0,dsW,zc,zTE)
+        % Outline of the wake's displacement thickness for the drawing.
+        % zc is the wake centre line at the stations xwM (arc length
+        % xwM - 1 from the trailing edge zTE). Each edge starts where its
+        % surface line ends (the march stops at x/c = 0.99), the thickness
+        % is split in the ratio of the two layers at the trailing edge and
+        % relaxes to an even split as the wake becomes symmetric, and the
+        % edge is blended out of the surface end point over 0.05 chord, so a
+        % thick (separated) layer meets the thinner wake without a step.
+        % Drawing only: no number depends on it.
+        sw = xwM - 1;
+        Tw = gradient(zc);  nw = 1i*Tw./abs(Tw);  t0 = Tw(1)/abs(Tw(1));
+        dw = movmean(dsW,5);                     % first wake panels are very short
+        ru = 0.5 + (dU0/max(dU0 + dL0,eps) - 0.5)*exp(-sw/0.15);
+        wU = oneEdge(zEndU,BLX*dw.*ru);
+        wL = oneEdge(zEndL,-BLX*dw.*(1 - ru));
+
+        function zb = oneEdge(z0,off)
+            loc = (z0 - zTE)*conj(t0);  s0 = real(loc);  o0 = imag(loc);
+            behind = sw > s0;                    % no hook back past the end point
+            if ~any(behind), zb = z0;  return, end
+            iFirst = find(behind,1);
+            o = off(behind) + (o0 - off(iFirst))*exp(-(sw(behind) - s0)/0.08);
+            zb = [z0, zc(behind) + o.*nw(behind)];
         end
-        out = blFromPaths(P,geo.c);
     end
 
     % =====================================================================
@@ -561,7 +569,7 @@ function varargout = profil
             return
         end
         r = G.r;  P = G.P;  zs = G.zs;  qu = G.qu;  ql = G.ql;  thW = G.thW;  HW = G.HW;
-        UeWi = G.UeWi;  ds0 = G.ds0;  sa = G.sa;  sw = G.sw;
+        UeWi = G.UeWi;  sa = G.sa;  sw = G.sw;
         dA0 = G.dA0;  dAn = G.dAn;  dgc = G.dgc;
 
         % viscous corrections kept for the flow field
@@ -586,9 +594,11 @@ function varargout = profil
                 if rr.ireat > 0, out.xRe(k) = p.x(rr.ireat); end
             end
         end
+        % wake drawn along the trailing-edge level, as in the outer flow
         yTE = ycE(end);
-        out.wake = [1 xwM] + 1i*(yTE + BLX*[ds0 vs.dsW]/2);
-        out.wakeL = [1 xwM] + 1i*(yTE - BLX*[ds0 vs.dsW]/2);
+        eU = find(isfinite(r{1}.dstar),1,'last');  eL = find(isfinite(r{2}.dstar),1,'last');
+        [out.wake,out.wakeL] = wakeEdges(out.dsurf{1}(eU),out.dsurf{2}(eL), ...
+            r{1}.dstar(eU),r{2}.dstar(eL),vs.dsW,xwM + 1i*yTE,1 + 1i*yTE);
         out.cd = 2*thW(end)/c*(UeWi(end)/U)^((HW(end) + 5)/2);
         out.thW = thW;  out.HW = HW;  out.P = P;  out.r = r;  out.hist = hist(1:it);
 
@@ -675,7 +685,9 @@ function varargout = profil
             Hf(k) = thwaitesHL(lam);
             ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
             if isfinite(xTrFix)
-                go = k > 3 && (xp(k) >= xTrFix || lam < -0.09);
+                % frozen: no laminar-separation override, or transition
+                % flickers between two stations and the iteration never settles
+                go = k > 3 && xp(k) >= xTrFix;
             else
                 go = k > 3 && (ReT > 1.174*(1 + 22400/ReS)*ReS^0.46 || lam < -0.09);
             end
@@ -789,79 +801,6 @@ function varargout = profil
         % unit sqrt(2r)/pi: 3 + (1-3x)/(2 sqrt x) ln|(1+sqrt x)/(1-sqrt x)|
         q = sqrt(x);
         u = 3 + (1 - 3*x)./(2*q).*log(abs((1 + q)./(1 - q)));
-    end
-
-    function out = blFromPaths(P,c)
-        % march both surfaces from the stagnation point; P{1} upper, P{2}
-        % lower, each with complex surface points z, chord position x and
-        % edge speed Ue; Squire-Young drag at the last point
-        nu = U*c/ReN;
-        out = struct('cd',0,'sep',false);
-        for k = 1:2
-            z = P{k}.z;  xk = P{k}.x;  Ue = max(P{k}.Ue,1e-9);
-            s = [0 cumsum(abs(diff(z)))];
-            r = marchBL(s,Ue,nu);
-            % displacement thickness drawn along the outward normal: both
-            % paths run downstream, so outward is +i*tangent on the upper
-            % surface and -i*tangent on the lower
-            T = gradient(z);  nrm = (3 - 2*k)*1i*T./abs(T);
-            out.dsurf{k} = z + BLX*r.dstar.*nrm;
-            out.x{k} = xk;  out.r{k} = r;  out.Ue{k} = Ue;
-            if r.itr < numel(z)                 % itr = last point: laminar all the way
-                out.zTr(k) = z(r.itr);  out.xTr(k) = xk(r.itr);
-            else
-                out.zTr(k) = NaN;  out.xTr(k) = NaN;
-            end
-            if r.isep > 0
-                out.zSep(k) = z(r.isep);  out.xSep(k) = xk(r.isep);
-                out.sep = true;
-            else
-                out.zSep(k) = NaN;  out.xSep(k) = NaN;
-            end
-            e = find(isfinite(r.theta),1,'last');
-            out.cd = out.cd + 2*r.theta(e)/c*(Ue(e)/U)^((r.H(e) + 5)/2);
-        end
-    end
-
-    function r = marchBL(s,Ue,nu)
-        n = numel(s);
-        theta = nan(1,n);  Hf = theta;  Cf = theta;
-        dU = gradient(Ue,s);
-        % --- laminar: Thwaites' integral, limit 0.075 nu/(dUe/ds) at stagnation
-        I = cumtrapz(s,Ue.^5);
-        th2 = 0.45*nu*I./Ue.^6;
-        th2(1) = 0.075*nu/max(dU(1),1e-9);
-        itr = n;
-        for k = 1:n
-            theta(k) = sqrt(th2(k));
-            lam = th2(k)/nu*dU(k);
-            [Hf(k),ell] = thwaitesHL(lam);
-            Cf(k) = 2*ell*nu/(Ue(k)*theta(k));
-            ReT = Ue(k)*theta(k)/nu;  ReS = Ue(k)*s(k)/nu;
-            % Michel's criterion in full: the factor (1 + 22400/Re_x) keeps it
-            % from firing near the stagnation point, where Re_x is tiny
-            if k > 3 && (ReT > 1.174*(1 + 22400/ReS)*ReS^0.46 || lam < -0.09)
-                itr = k;  break             % transition (or laminar separation bubble)
-            end
-        end
-        % --- turbulent: Head's entrainment method, Heun steps
-        isep = 0;
-        if itr < n
-            Hf(itr) = 1.4;
-            th = theta(itr);  Q = Ue(itr)*th*headH1(1.4);
-            for k = itr:n-1
-                dsl = s(k+1) - s(k);
-                [d1,d2] = headRHS(th,Q,Ue(k),dU(k),nu);
-                [e1,e2] = headRHS(th + dsl*d1,Q + dsl*d2,Ue(k+1),dU(k+1),nu);
-                th = th + dsl/2*(d1 + e1);  Q = Q + dsl/2*(d2 + e2);
-                HH1 = max(Q/(Ue(k+1)*th),3.31);
-                theta(k+1) = th;  Hf(k+1) = headH(HH1);
-                Cf(k+1) = ludwiegTillmann(Hf(k+1),Ue(k+1)*th/nu);
-                if Hf(k+1) > 2.4, isep = k+1;  break; end
-            end
-        end
-        r = struct('theta',theta,'H',Hf,'Cf',Cf,'dstar',Hf.*theta,'itr',itr,'isep',isep);
-        r.dstar(~isfinite(r.dstar)) = NaN;
     end
 
     function [Hf,ell] = thwaitesHL(lam)
@@ -1013,6 +952,8 @@ function varargout = profil
                    & imag(z) >= YL(1) & imag(z) <= YL(2);
         if mode == 1
             setJoukowski();
+            bl = [];
+            set([hBL hTr hSep],'XData',NaN,'YData',NaN);
             % body and circle
             zc = mu + a*exp(1i*linspace(0,2*pi,400));
             zb = fmap(zc);
@@ -1021,8 +962,8 @@ function varargout = profil
             set(hZmu,'XData',real(mu),'YData',imag(mu));
             % streamlines are traced in the circle plane and mapped
             if get(cStr,'Value')
-                keep = @(zeta) abs(zeta - mu) > 1.002*a & boxOK(fmap(zeta));
-                [xz,yz] = pf.traceStreamlines(@wZeta,invmap(zLeft),ones(1,NLEFT),H,NSTEP,keep);
+                keepS = @(zeta) abs(zeta - mu) > 1.002*a & boxOK(fmap(zeta));
+                [xz,yz] = pf.traceStreamlines(@wZeta,invmap(zLeft),ones(1,NLEFT),H,NSTEP,keepS);
                 zz = fmap(xz + 1i*yz);
                 set(hS,'XData',real(zz),'YData',imag(zz),'Visible','on');
                 set(hZs,'XData',xz,'YData',yz,'Visible','on');
@@ -1049,20 +990,15 @@ function varargout = profil
             [xu,cpu,xl,cpl,geo] = exactCp();
             th = thinFromGeometry(geo.yt,geo.yc,geo.alphaC);
             set(hExU,'XData',xu,'YData',cpu);  set(hExL,'XData',xl,'YData',cpl);
+            hLeg.String(1:2) = {'exact, upper','exact, lower'};
             CLex = 2*(-Gam)/(U*geo.c);
             info = {sprintf('t/c %.3f   camber/c %.3f',2*max(geo.yt),max(abs(geo.yc))), ...
                     sprintf('AoA (chord)= %.2f deg',rad2deg(geo.alphaC)), ...
                     sprintf('zero lift  = %.2f deg',rad2deg(geo.alphaC - aoa - betaK)), ...
                     sprintf('%s (cw)     = %.4f',char(915),-Gam), ...
                     sprintf('CL exact   = %.4f',CLex), ...
-                    sprintf('CL thin    = %.4f (x%.3f)',th.CL,CLex/th.CL)};
-            if blOn
-                bl = boundaryLayer(geo,zF);
-                info = [info, showBL(CLex)];
-            else
-                bl = [];
-                set([hBL hTr hSep],'XData',NaN,'YData',NaN);
-            end
+                    sprintf('CL thin    = %.4f (x%.3f)',th.CL,CLex/th.CL), ...
+                    '', 'potential flow: no drag;', 'boundary layer in thin mode'};
         else
             set([hBL hTr hSep],'XData',NaN,'YData',NaN);
             solveDistributions();
@@ -1141,25 +1077,6 @@ function varargout = profil
             set(hQ,'Visible','off');
         end
         set(hP,'Visible',onoff(get(cPart,'Value')));
-    end
-
-    function lines = showBL(CL)
-        % draw the boundary layer held in bl and return its info lines
-        ds = [bl.dsurf{1}, NaN, bl.dsurf{2}];
-        set(hBL,'XData',real(ds),'YData',imag(ds));
-        set(hTr,'XData',real(bl.zTr),'YData',imag(bl.zTr));
-        set(hSep,'XData',real(bl.zSep),'YData',imag(bl.zSep));
-        lines = {sprintf('Re = %.3g, %s* drawn x%d',ReN,char(948),BLX), ...
-                 ['transition up ' sideStr(bl.xTr(1),'laminar') ...
-                  ', lo ' sideStr(bl.xTr(2),'laminar')]};
-        if bl.sep
-            lines{end+1} = ['SEPARATED up ' sideStr(bl.xSep(1),'attached') ...
-                            ', lo ' sideStr(bl.xSep(2),'attached')];
-            lines{end+1} = 'cd not valid past separation';
-        else
-            lines{end+1} = sprintf('cd (Squire-Young) = %.5f',bl.cd);
-            lines{end+1} = sprintf('L/D = %.0f',CL/bl.cd);
-        end
     end
 
     function lines = showVII(CLi)
@@ -1263,10 +1180,11 @@ function varargout = profil
         if isJ, hLeg.String(1:2) = {'exact, upper','exact, lower'}; end
         configureSliders();
         configureBottom();
+        set([cBL hRe],'Enable',onoff(~isJ));     % the boundary layer is thin mode only
         if isJ
             set(hHint,'String',['Circle plane (bottom right): freestream + doublet + ' ...
                 'vortex, mapped onto the airfoil. Solid Cp exact, dashed thin theory. ' ...
-                'Boundary layer: Thwaites + Head, triangle = transition, star = separation.']);
+                'Potential flow only: the boundary layer and viscous polar are in thin mode.']);
         else
             set(hHint,'String',['Drag red source points (thickness) and green vortex ' ...
                 'points (camber). Sliders scale them linearly; AoA adds the exact ' ...
@@ -1436,6 +1354,116 @@ function varargout = profil
         else
             setMode(2);
         end
+    end
+
+    % =====================================================================
+    %  Polar
+    % =====================================================================
+    function askPolar()
+        % ask for the angle range, then sweep
+        if mode == 2, def = {'-4','16','1'}; else, def = {'-4','12','1'}; end
+        ans_ = inputdlg({'from [deg]','to [deg]','step [deg]'},'Polar',1,def);
+        if isempty(ans_), return, end
+        v = str2double(ans_);
+        if any(~isfinite(v)) || v(3) <= 0 || v(2) <= v(1), return, end
+        makePolar(v(1):v(3):v(2));
+    end
+
+    function T = makePolar(alist)
+        % Sweep the angle of attack for the airfoil as it is set up now and
+        % plot the polar. Thin mode: the coupled boundary layer at the
+        % current Re (on even if its checkbox is off), stepping away from
+        % 0 deg in both directions so that each solution starts from its
+        % neighbour. Joukowski mode: exact potential flow (lift only).
+        alist = sort(alist(:).');
+        if mode == 2
+            aSave = aoaT;  vsSave = vs;  blSave = blOn;
+            [~,i0] = min(abs(alist));
+            order = [i0:numel(alist), i0-1:-1:1];
+            R = nan(numel(alist),9);
+            vs = [];  vsStart = [];
+            for q = 1:numel(order)
+                k = order(q);
+                if k == i0 - 1, vs = vsStart; end      % downward branch starts at the middle
+                aoaT = deg2rad(alist(k));
+                solveDistributions();
+                set(hInfo,'String',{sprintf('polar: %g deg  (%d of %d)',alist(k),q,numel(alist))});
+                drawnow limitrate
+                o = viscousThin(VIT);
+                if k == i0, vsStart = vs; end
+                c = hypot(1,ycE(end));
+                CLi = 2*sum(gam.*dxp)/(U*c);
+                if o.fail
+                    R(k,:) = [alist(k), rad2deg(-atan(ycE(end))), CLi, NaN(1,5), 0];
+                else
+                    R(k,:) = [alist(k), rad2deg(-atan(ycE(end))), CLi, CLi + o.dCL, o.cd, ...
+                        o.xTr(1), o.xTr(2), o.xSep(1), o.conv || o.res < 0.02];
+                end
+            end
+            aoaT = aSave;  vs = vsSave;  blOn = blSave;
+            T = array2table(R,'VariableNames',{'alpha','alphaChord','CLinv','CL','cd', ...
+                'xtrUpper','xtrLower','xsepUpper','converged'});
+        else
+            aSave = aoaT;  aJ = aoa;
+            R = nan(numel(alist),4);
+            for k = 1:numel(alist)
+                aoa = deg2rad(alist(k));
+                setJoukowski();
+                [~,~,~,~,geo] = exactCp();
+                th = thinFromGeometry(geo.yt,geo.yc,geo.alphaC);
+                R(k,:) = [alist(k), rad2deg(geo.alphaC), 2*(-Gam)/(U*geo.c), th.CL];
+            end
+            aoa = aJ;  aoaT = aSave;
+            T = array2table(R,'VariableNames',{'alpha','alphaChord','CL','CLthin'});
+        end
+        assignin('base','profilPolar',T);
+        showPolar(T);
+        redraw();
+    end
+
+    function showPolar(T)
+        pf_ = findobj(0,'Type','figure','Tag','profilPolar');
+        if isempty(pf_)
+            pf_ = figure('Tag','profilPolar','Name','Profil - polar','NumberTitle','off', ...
+                'Color','w','Position',[120 80 1100 760]);
+            try theme(pf_,'light'); catch, end   %#ok<*NOSEMI>
+        end
+        clf(pf_);
+        cV = [0.13 0.33 0.62];  cI = [0.55 0.55 0.55];
+        if ismember('cd',T.Properties.VariableNames)
+            ok = T.converged == 1;
+            ttl = sprintf('Thin airfoil, Re = %.3g  (open markers: not converged)',ReN);
+            mk = @(ax,x,y) [plot(ax,x,y,'-','Color',cV,'LineWidth',1.4), ...
+                plot(ax,x(ok),y(ok),'o','Color',cV,'MarkerFaceColor',cV,'MarkerSize',5), ...
+                plot(ax,x(~ok),y(~ok),'o','Color',cV,'MarkerFaceColor','w','MarkerSize',5)];
+            ax1 = subplot(2,2,1,'Parent',pf_);  hold(ax1,'on');  grid(ax1,'on');
+            plot(ax1,T.alphaChord,T.CLinv,'--','Color',cI,'LineWidth',1.2);
+            mk(ax1,T.alphaChord,T.CL);
+            xlabel(ax1,'\alpha (chord) [deg]');  ylabel(ax1,'C_L');
+            legend(ax1,{'inviscid','viscous'},'Location','northwest');
+            ax2 = subplot(2,2,2,'Parent',pf_);  hold(ax2,'on');  grid(ax2,'on');
+            mk(ax2,T.cd,T.CL);  xlabel(ax2,'c_d');  ylabel(ax2,'C_L');  title(ax2,'drag polar');
+            ax3 = subplot(2,2,3,'Parent',pf_);  hold(ax3,'on');  grid(ax3,'on');
+            mk(ax3,T.alphaChord,T.cd);  xlabel(ax3,'\alpha (chord) [deg]');  ylabel(ax3,'c_d');
+            ax4 = subplot(2,2,4,'Parent',pf_);  hold(ax4,'on');  grid(ax4,'on');
+            mk(ax4,T.alphaChord,T.CL./T.cd);  xlabel(ax4,'\alpha (chord) [deg]');  ylabel(ax4,'L/D');
+            sgtitle(pf_,ttl);
+        else
+            ax1 = axes('Parent',pf_);  hold(ax1,'on');  grid(ax1,'on');
+            plot(ax1,T.alphaChord,T.CL,'-o','Color',cV,'MarkerFaceColor',cV,'LineWidth',1.4,'MarkerSize',5);
+            plot(ax1,T.alphaChord,T.CLthin,'--','Color',cI,'LineWidth',1.2);
+            xlabel(ax1,'\alpha (chord) [deg]');  ylabel(ax1,'C_L');
+            legend(ax1,{'exact (Joukowski, Kutta)','thin airfoil theory'},'Location','northwest');
+            title(ax1,'Joukowski airfoil: lift (potential flow, no drag)');
+        end
+        uicontrol(pf_,'Style','pushbutton','String','Save CSV...','Units','normalized', ...
+            'Position',[0.86 0.005 0.12 0.04],'Callback',@(~,~) savePolar(T));
+    end
+
+    function savePolar(T)
+        [fn,fp] = uiputfile('*.csv','Save polar','polar.csv');
+        if isequal(fn,0), return, end
+        writetable(T,fullfile(fp,fn));
     end
 
     function s = getState()
